@@ -238,11 +238,28 @@ export default function App() {
       });
   }, []);
 
+  const loadYougileTasks = useCallback(async () => {
+    setYougileLoading(true);
+    setYougileError(null);
+    try {
+      const yt = await fetchJson<YougileTasksResponse>(
+        "/api/integrations/yougile/tasks?limit=8",
+      );
+      setYougileTasks(yt.items || []);
+      setYougileEmployee(yt.employee || "Сотрудник");
+    } catch (e) {
+      setYougileTasks([]);
+      setYougileError(
+        e instanceof Error ? e.message : "Не удалось загрузить задачи YouGile",
+      );
+    } finally {
+      setYougileLoading(false);
+    }
+  }, []);
+
   const loadKpiOnly = useCallback(async () => {
     if (!dateFrom || !dateTo) return;
     const q = periodQuery(dateFrom, dateTo);
-    setYougileLoading(true);
-    setYougileError(null);
     setRawMaterialInTransitError(null);
     const transitP = fetchJson<{ sum_rub: number }>("/api/kpi/raw-material-in-transit")
       .then((x) => ({ ok: true as const, sum: x.sum_rub }))
@@ -266,21 +283,12 @@ export default function App() {
       setRawMaterialInTransitRub(null);
       setRawMaterialInTransitError(transitRes.err);
     }
-    try {
-      const yt = await fetchJson<YougileTasksResponse>(
-        "/api/integrations/yougile/tasks?limit=8",
-      );
-      setYougileTasks(yt.items || []);
-      setYougileEmployee(yt.employee || "Сотрудник");
-    } catch (e) {
-      setYougileTasks([]);
-      setYougileError(
-        e instanceof Error ? e.message : "Не удалось загрузить задачи YouGile",
-      );
-    } finally {
-      setYougileLoading(false);
-    }
   }, [dateFrom, dateTo]);
+
+  useEffect(() => {
+    if (!defaultsLoaded) return;
+    void loadYougileTasks();
+  }, [defaultsLoaded, loadYougileTasks]);
 
   const syncFromSheets = useCallback(async () => {
     if (!dateFrom || !dateTo) return;
@@ -476,9 +484,7 @@ export default function App() {
 
       <div className="dashboard-main">
       <section className="filter-bar panel">
-        <div className="filter-grid">
-          <div className="filter-col-left">
-            <div className="period-nav panel">
+        <div className="period-nav panel">
             <div className="period-range">
               <label className="period-date-field">
                 <span>От</span>
@@ -513,8 +519,10 @@ export default function App() {
               <span className="period-nav-title">{periodNavLabel}</span>
               <button type="button" className="period-arrow" onClick={() => shiftPeriod(1)} aria-label="Следующий период">▶</button>
             </div>
-            </div>
-          </div>
+        </div>
+      </section>
+
+      <section className="yougile-strip panel" aria-label="Задачи YouGile">
           <aside className="yougile-widget panel">
             <h3>Задачи YouGile: {yougileEmployee}</h3>
             {yougileLoading ? (
@@ -576,7 +584,6 @@ export default function App() {
               <p className="sub">Активных задач не найдено.</p>
             )}
           </aside>
-          </div>
       </section>
 
       {kpi !== null && (

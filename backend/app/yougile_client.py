@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -131,11 +132,42 @@ def _is_task_active(task: dict[str, Any]) -> bool:
     return True
 
 
+def _web_ui_host() -> str:
+    return _base_url().rsplit("/api-v2", 1)[0].rstrip("/")
+
+
+def _task_short_anchor(task: dict[str, Any]) -> str | None:
+    """Короткий ключ задачи для # в URL (например MOY-483), если API его отдаёт."""
+    for key in ("key", "taskKey", "shortId", "publicId", "humanId"):
+        v = _norm_text(task.get(key))
+        if v and len(v) < 80:
+            return v
+    tid = _norm_text(task.get("id"))
+    if tid and re.match(r"^[A-Za-zА-Яа-яЁё]{2,12}-\d+$", tid):
+        return tid
+    return None
+
+
 def _task_url(task: dict[str, Any]) -> str | None:
     direct = _norm_text(task.get("url"))
-    if direct:
+    ignore_api = os.getenv("YOUGILE_TASK_IGNORE_API_URL", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if direct and not ignore_api:
         return direct
-    host = _base_url().split("/api-v2")[0]
+
+    host = _web_ui_host()
+    style = os.getenv("YOUGILE_TASK_LINK_STYLE", "").strip().lower()
+    lang = os.getenv("YOUGILE_WEB_LANG", "ru").strip() or "ru"
+
+    # Как в браузере: .../team/my-tasks?lang=ru#MOY-483 (хост тот же у всей компании)
+    if style == "my_tasks":
+        frag = _task_short_anchor(task) or _norm_text(task.get("id"))
+        if frag:
+            return f"{host}/team/my-tasks?lang={lang}#{frag}"
+
     project_id = _norm_text(task.get("idTaskProject"))
     if project_id:
         return f"{host}/#/task/{project_id}"

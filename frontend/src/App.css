@@ -89,8 +89,9 @@
   letter-spacing: -0.02em;
 }
 
-/* ========== Filter toolbar ========== */
-.filter-bar {
+/* Период и YouGile — отдельные полосы на всю ширину, без общей сетки */
+.filter-bar,
+.yougile-strip {
   margin-bottom: 1.1rem;
   padding: 1rem 1.15rem;
   background: rgba(255, 255, 255, 0.72);
@@ -100,20 +101,11 @@
   box-shadow: 0 8px 32px rgba(15, 23, 42, 0.06);
 }
 
-.filter-grid {
-  display: grid;
-  grid-template-columns: max-content minmax(0, 1fr);
-  gap: clamp(0.55rem, 1.8vw, 0.9rem);
-  align-items: start;
-}
-
-.filter-col-left {
-  display: flex;
-  flex-direction: column;
-  gap: clamp(0.45rem, 1.4vw, 0.7rem);
+.yougile-strip .yougile-widget {
+  width: 100%;
   min-width: 0;
-  justify-self: start;
   max-width: 100%;
+  box-sizing: border-box;
 }
 
 .period-nav {
@@ -1002,8 +994,8 @@
 
 /* ========== Grid safety ========== */
 .main-dashboard-grid > *,
-.filter-grid > *,
-.filter-col-left > *,
+.filter-bar > *,
+.yougile-strip > *,
 .raw-stock-line > *,
 .yougile-columns > *,
 .finance-kpis > * {
@@ -1048,10 +1040,6 @@
 }
 
 @media (max-width: 980px) {
-  .filter-grid {
-    grid-template-columns: 1fr;
-  }
-
   .finance-kpis {
     grid-template-columns: 1fr;
   }
@@ -1131,7 +1119,8 @@
     padding: 0.85rem 0.65rem;
   }
 
-  .filter-bar {
+  .filter-bar,
+  .yougile-strip {
     padding: 0.75rem 0.8rem;
   }
 
