@@ -1,0 +1,23 @@
+name: dashboard
+
+services:
+  api:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      TZ: ${TZ:-UTC}
+      DATABASE_URL: sqlite:////data/dashboard.db
+    volumes:
+      - dashboard_data:/data
+
+  web:
+    build: ./frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+
+volumes:
+  dashboard_data:

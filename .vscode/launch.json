@@ -1,0 +1,30 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Backend: FastAPI (uvicorn)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["app.main:app", "--reload", "--host", "127.0.0.1", "--port", "8000"],
+      "cwd": "${workspaceFolder}/backend",
+      "python": "${workspaceFolder}/backend/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "jinja": true
+    },
+    {
+      "type": "chrome",
+      "request": "launch",
+      "name": "Браузер: фронт Vite (5173)",
+      "url": "http://localhost:5173",
+      "webRoot": "${workspaceFolder}/frontend"
+    },
+    {
+      "type": "chrome",
+      "request": "launch",
+      "name": "Браузер: Docker web (8080)",
+      "url": "http://localhost:8080",
+      "webRoot": "${workspaceFolder}/frontend"
+    }
+  ]
+}
