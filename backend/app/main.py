@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
 from typing import Annotated, Optional
@@ -28,7 +29,9 @@ from app.yougile_client import (
     get_employee_tasks,
 )
 
-load_dotenv()
+_backend_dir = Path(__file__).resolve().parent.parent
+load_dotenv(_backend_dir.parent / ".env")
+load_dotenv(_backend_dir / ".env")
 _yougile_employee_default = os.getenv("YOUGILE_EMPLOYEE", "Татьяна Живетьева").strip()
 _yougile_employee_id_default = os.getenv("YOUGILE_EMPLOYEE_ID", "").strip()
 
@@ -188,6 +191,18 @@ def kpi_daily_breakdown(
     return {"days": out}
 
 
+def _reorder_group_key(s: str) -> str:
+    """Схлопывание пробелов/NBSP — одна кнопка на одну логическую категорию из столбца C."""
+    t = str(s).replace("\u00a0", " ").strip()
+    return " ".join(t.split())
+
+
+def _is_reorder_sheet_header_row(name: str, group: str) -> bool:
+    n = name.casefold().replace("ё", "е").strip()
+    g = group.casefold().replace("ё", "е").strip()
+    return n == "наименование" and g == "группа"
+
+
 @app.get("/api/kpi/reorder-raw-materials")
 def kpi_reorder_raw_materials() -> dict:
     spreadsheet_id = os.getenv(
@@ -201,12 +216,21 @@ def kpi_reorder_raw_materials() -> dict:
         spreadsheet_id=spreadsheet_id,
         sheet_name=sheet_name,
         tq="select B, C, G",
+        prefer_formatted_for_cols=frozenset({"C"}),
     )
 
+    categories_by_key: dict[str, str] = {}
     candidates: list[dict] = []
     for r in rows:
         name = str(r.get("B") or "").strip()
         group_raw = str(r.get("C") or "").strip()
+        if _is_reorder_sheet_header_row(name, group_raw):
+            continue
+        if group_raw:
+            gk = _reorder_group_key(group_raw)
+            if gk:
+                categories_by_key.setdefault(gk, group_raw.strip())
+
         if not name:
             continue
         group_norm = group_raw.casefold().replace("ё", "е")
@@ -224,8 +248,11 @@ def kpi_reorder_raw_materials() -> dict:
         )
 
     candidates.sort(key=lambda x: (x["stock"], x["name"]))
-    top = candidates[:8]
-    return {"items": top}
+    categories = sorted(
+        categories_by_key.values(),
+        key=lambda s: s.casefold().replace("ё", "е"),
+    )
+    return {"items": candidates, "categories": categories}
 
 
 def _norm_status_cell(value: object) -> str:

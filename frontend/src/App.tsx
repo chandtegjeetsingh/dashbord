@@ -162,6 +162,36 @@ function dayWord(n: number): string {
   return "дней";
 }
 
+/** Совпадение с бэкендом `_reorder_group_key` для фильтра по столбцу C. */
+function normalizeReorderGroupKey(raw: string | null | undefined): string {
+  if (raw == null) return "";
+  return raw
+    .replace(/\u00a0/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+/** Текст на кнопке: весь хвост после последнего «/». Без слэша — вся строка. */
+function shortenReorderCategoryButtonLabel(full: string): string {
+  const t = normalizeReorderGroupKey(full);
+  if (!t) return full;
+  const idx = t.lastIndexOf("/");
+  if (idx < 0 || idx >= t.length - 1) return t;
+  const tail = t.slice(idx + 1).trim();
+  return tail.length > 0 ? tail : t;
+}
+
+function reorderCategoryLabelsFromItems(items: ReorderItem[]): string[] {
+  const m = new Map<string, string>();
+  for (const it of items) {
+    const raw = (it.group || "").trim();
+    if (!raw) continue;
+    const k = normalizeReorderGroupKey(raw);
+    if (k) m.set(k, raw.replace(/\u00a0/g, " ").trim());
+  }
+  return [...m.values()].sort((a, b) => a.localeCompare(b, "ru"));
+}
+
 /** Один раз читает body как текст, затем JSON — без SyntaxError на пустом ответе. */
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const r = await fetch(url, init);
@@ -208,6 +238,10 @@ export default function App() {
   const [syncDetail, setSyncDetail] = useState<string | null>(null);
   const [periodMode, setPeriodMode] = useState<PeriodMode>("month");
   const [reorderItems, setReorderItems] = useState<ReorderItem[]>([]);
+  /** Все уникальные категории из столбца C листа (с бэкенда), не только строки «к заказу». */
+  const [reorderCategoryLabels, setReorderCategoryLabels] = useState<string[]>([]);
+  /** Нормализованные ключи `_reorder_group_key`. */
+  const [reorderCategoryFilter, setReorderCategoryFilter] = useState<string[]>([]);
   const [rawMaterialInTransitRub, setRawMaterialInTransitRub] = useState<number | null>(
     null,
   );
@@ -270,12 +304,21 @@ export default function App() {
     const [kc, kd, rr, transitRes] = await Promise.all([
       fetchJson<KpiPayload>(`/api/kpi/current?${q}`),
       fetchJson<{ days: DailyBreakdownDay[] }>(`/api/kpi/daily-breakdown?${q}`),
-      fetchJson<{ items: ReorderItem[] }>("/api/kpi/reorder-raw-materials"),
+      fetchJson<{ items: ReorderItem[]; categories?: string[] }>(
+        "/api/kpi/reorder-raw-materials",
+      ),
       transitP,
     ]);
     setKpi(kc);
     setDailyDays(kd.days || []);
-    setReorderItems(rr.items || []);
+    const items = rr.items || [];
+    const fromApi = rr.categories ?? [];
+    const labels =
+      fromApi.length > 0 ? fromApi : reorderCategoryLabelsFromItems(items);
+    setReorderItems(items);
+    setReorderCategoryLabels(labels);
+    const allowedKeys = new Set(labels.map((c) => normalizeReorderGroupKey(c)));
+    setReorderCategoryFilter((prev) => prev.filter((k) => allowedKeys.has(k)));
     if (transitRes.ok) {
       setRawMaterialInTransitRub(transitRes.sum);
       setRawMaterialInTransitError(null);
@@ -369,6 +412,26 @@ export default function App() {
     const pad = Math.max(1, Math.round(max * 0.08));
     return [0, max + pad];
   }, [dailyDays]);
+
+  const displayedReorderItems = useMemo(() => {
+    if (reorderCategoryFilter.length === 0) return reorderItems;
+    const sel = new Set(reorderCategoryFilter);
+    return reorderItems.filter((it) =>
+      sel.has(normalizeReorderGroupKey(it.group)),
+    );
+  }, [reorderItems, reorderCategoryFilter]);
+
+  const toggleReorderCategory = useCallback((labelFromSheet: string) => {
+    const k = normalizeReorderGroupKey(labelFromSheet);
+    if (!k) return;
+    setReorderCategoryFilter((prev) =>
+      prev.includes(k) ? prev.filter((c) => c !== k) : [...prev, k],
+    );
+  }, []);
+
+  const clearReorderCategoryFilter = useCallback(() => {
+    setReorderCategoryFilter([]);
+  }, []);
 
   const periodNavLabel = useMemo(() => {
     if (!dateFrom || !dateTo) return "";
@@ -800,32 +863,83 @@ export default function App() {
 
           <section className="panel procurement-panel">
             <div className="kpi-grid procurement-grid">
-              <a
-                className="kpi-card kpi-card-list kpi-card-wide reorder-link-card"
-                href="https://docs.google.com/spreadsheets/d/1eUdgokEoZ72xePF8RmQZbuWwoYNuJH9rvU3WvUxBTEE/edit?gid=1246024051#gid=1246024051"
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                <p className="list-title">Заказать сырьё</p>
-                <div className="kpi-list-head">
-                  <span>Наименование</span>
-                  <span>Хватит на</span>
+              <div className="kpi-card kpi-card-list kpi-card-wide reorder-card">
+                <div className="reorder-card-title-row">
+                  <p className="list-title">Заказать сырьё</p>
+                  <a
+                    className="reorder-sheet-link"
+                    href="https://docs.google.com/spreadsheets/d/1eUdgokEoZ72xePF8RmQZbuWwoYNuJH9rvU3WvUxBTEE/edit?gid=1246024051#gid=1246024051"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Таблица ↗
+                  </a>
                 </div>
-                {reorderItems.length > 0 ? (
-                  <ul className="kpi-list">
-                    {reorderItems.map((it) => (
-                      <li key={it.name}>
-                        <span>{it.name}</span>
-                        <strong>
-                          {it.stock.toLocaleString("ru-RU")} {dayWord(it.stock)}
-                        </strong>
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="sub">Нет позиций для заказа.</p>
-                )}
-              </a>
+                <p className="reorder-sheet-hint">
+                  Если на листе в Google включён фильтр (иконка в шапке столбца), в
+                  дашборд попадают только видимые строки — для полного списка снимите
+                  фильтр в таблице.
+                </p>
+                {reorderCategoryLabels.length > 0 ? (
+                  <div
+                    className="reorder-category-toolbar"
+                    role="group"
+                    aria-label="Фильтр по группе из столбца «Группа»"
+                  >
+                    <div className="reorder-category-filters">
+                      {reorderCategoryLabels.map((label) => {
+                        const key = normalizeReorderGroupKey(label);
+                        const active = reorderCategoryFilter.includes(key);
+                        return (
+                          <button
+                            type="button"
+                            key={key}
+                            className={`reorder-category-btn${active ? " reorder-category-btn--active" : ""}`}
+                            aria-pressed={active}
+                            title={label}
+                            onClick={() => {
+                              toggleReorderCategory(label);
+                            }}
+                          >
+                            {shortenReorderCategoryButtonLabel(label)}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    {reorderCategoryFilter.length > 0 ? (
+                      <button
+                        type="button"
+                        className="reorder-category-clear"
+                        onClick={clearReorderCategoryFilter}
+                      >
+                        Сбросить фильтр
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
+                <div className="reorder-list-panel">
+                  <div className="kpi-list-head">
+                    <span>Наименование</span>
+                    <span>Хватит на</span>
+                  </div>
+                  {displayedReorderItems.length > 0 ? (
+                    <ul className="kpi-list">
+                      {displayedReorderItems.map((it) => (
+                        <li key={`${(it.group || "").trim()}\t${it.name}`}>
+                          <span>{it.name}</span>
+                          <strong>
+                            {it.stock.toLocaleString("ru-RU")} {dayWord(it.stock)}
+                          </strong>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : reorderItems.length > 0 ? (
+                    <p className="sub">Нет позиций в выбранных категориях.</p>
+                  ) : (
+                    <p className="sub">Нет позиций для заказа.</p>
+                  )}
+                </div>
+              </div>
             </div>
           </section>
           </div>
