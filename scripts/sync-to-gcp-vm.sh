@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Выгрузка проекта на VM Google Cloud без GitHub: архив + gcloud scp/ssh.
 # Запуск с Mac из корня репозитория: ./scripts/sync-to-gcp-vm.sh
+# Если таймаут на внешний IP:22: USE_IAP=1 ./scripts/sync-to-gcp-vm.sh
 set -euo pipefail
 
 # Длинный scp/ssh: не обрывать соединение при заливке архива
@@ -12,6 +13,12 @@ ZONE="${ZONE:-us-west1-b}"
 PROJECT="${PROJECT:-capable-country-491808-g4}"
 # Каталог на VM относительно $HOME (без ведущего слэша)
 DASHBOARD_REMOTE_DIR="${DASHBOARD_REMOTE_DIR:-dashbord}"
+# Если с интернета порт 22 закрыт: USE_IAP=1 ./scripts/sync-to-gcp-vm.sh
+USE_IAP="${USE_IAP:-0}"
+IAP_FLAG=()
+if [[ "$USE_IAP" == "1" ]]; then
+  IAP_FLAG=(--tunnel-through-iap)
+fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -t dashboard-sync.XXXXXX.tar.gz)"
@@ -51,11 +58,14 @@ echo "    Размер файла: $(du -h "$TMP" | awk '{print $1}')"
 
 echo ""
 echo "━━ [3/4] Копирование на VM: ${VM_NAME}:/tmp/dashboard-sync.tgz ━━"
+if [[ "${#IAP_FLAG[@]}" -gt 0 ]]; then
+  echo "    Режим: IAP (--tunnel-through-iap)"
+fi
 echo "    (точки = идёт передача, обычно несколько минут)"
 printf "    "
 set +e
 (
-  gcloud compute scp "${GCLOUD_SCP_FLAGS[@]}" "$TMP" "${VM_NAME}:/tmp/dashboard-sync.tgz" \
+  gcloud compute scp "${IAP_FLAG[@]}" "${GCLOUD_SCP_FLAGS[@]}" "$TMP" "${VM_NAME}:/tmp/dashboard-sync.tgz" \
     --zone="$ZONE" \
     --project="$PROJECT" \
     --verbosity=warning
@@ -77,7 +87,7 @@ echo "    Заливка завершена."
 
 echo ""
 echo "━━ [4/4] Распаковка на VM в ~/${DASHBOARD_REMOTE_DIR} ━━"
-gcloud compute ssh "${GCLOUD_SSH_FLAGS[@]}" "$VM_NAME" \
+gcloud compute ssh "${IAP_FLAG[@]}" "${GCLOUD_SSH_FLAGS[@]}" "$VM_NAME" \
   --zone="$ZONE" \
   --project="$PROJECT" \
   --verbosity=warning \

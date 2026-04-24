@@ -10,6 +10,12 @@ VM_NAME="${VM_NAME:-dash-vm}"
 ZONE="${ZONE:-us-west1-b}"
 PROJECT="${PROJECT:-capable-country-491808-g4}"
 DASHBOARD_REMOTE_DIR="${DASHBOARD_REMOTE_DIR:-dashbord}"
+# Прямой SSH на :22 недоступен — деплой через IAP (как gcloud compute ssh --tunnel-through-iap)
+USE_IAP="${USE_IAP:-0}"
+IAP_FLAG=()
+if [[ "$USE_IAP" == "1" ]]; then
+  IAP_FLAG=(--tunnel-through-iap)
+fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -29,6 +35,11 @@ usage() {
 
 Переменные окружения: VM_NAME, ZONE, PROJECT, DASHBOARD_REMOTE_DIR
 
+  USE_IAP=1  — ssh/scp через IAP (если таймаут на внешний IP:22)
+
+  Если IAP даёт 4003 / failed to connect to backend: во VPC нужно правило
+  INGRESS tcp:22 с источника 35.235.240.0/20 (IAP), на цель — эту VM / её network tags.
+
 Режим «all» и флаги: DEPLOY_SKIP_SYNC=1, DEPLOY_SKIP_ENV=1, DEPLOY_SKIP_COMPOSE=1
 EOF
 }
@@ -40,7 +51,7 @@ fi
 
 run_sync() {
   echo "=== Шаг: код на VM (${VM_NAME}) ==="
-  DASHBOARD_REMOTE_DIR="$DASHBOARD_REMOTE_DIR" \
+  USE_IAP="$USE_IAP" DASHBOARD_REMOTE_DIR="$DASHBOARD_REMOTE_DIR" \
     VM_NAME="$VM_NAME" ZONE="$ZONE" PROJECT="$PROJECT" \
     "$ROOT/scripts/sync-to-gcp-vm.sh"
 }
@@ -57,7 +68,7 @@ run_env() {
   printf "    копирование"
   set +e
   (
-    gcloud compute scp "${GCLOUD_SCP_FLAGS[@]}" "$ROOT/.env" "${VM_NAME}:~/${DASHBOARD_REMOTE_DIR}/.env" \
+    gcloud compute scp "${IAP_FLAG[@]}" "${GCLOUD_SCP_FLAGS[@]}" "$ROOT/.env" "${VM_NAME}:~/${DASHBOARD_REMOTE_DIR}/.env" \
       --zone="$ZONE" \
       --project="$PROJECT" \
       --verbosity=warning
@@ -78,7 +89,7 @@ run_env() {
 run_up() {
   echo ""
   echo "=== Шаг: Docker Compose на VM ==="
-  gcloud compute ssh "${GCLOUD_SSH_FLAGS[@]}" "$VM_NAME" \
+  gcloud compute ssh "${IAP_FLAG[@]}" "${GCLOUD_SSH_FLAGS[@]}" "$VM_NAME" \
     --zone="$ZONE" \
     --project="$PROJECT" \
     --verbosity=warning \
