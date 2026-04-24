@@ -68,7 +68,7 @@ run_env() {
   printf "    копирование"
   set +e
   (
-    gcloud compute scp "${IAP_FLAG[@]}" "${GCLOUD_SCP_FLAGS[@]}" "$ROOT/.env" "${VM_NAME}:~/${DASHBOARD_REMOTE_DIR}/.env" \
+    gcloud compute scp "${IAP_FLAG[@]+"${IAP_FLAG[@]}"}" "${GCLOUD_SCP_FLAGS[@]}" "$ROOT/.env" "${VM_NAME}:~/${DASHBOARD_REMOTE_DIR}/.env" \
       --zone="$ZONE" \
       --project="$PROJECT" \
       --verbosity=warning
@@ -89,7 +89,7 @@ run_env() {
 run_up() {
   echo ""
   echo "=== Шаг: Docker Compose на VM ==="
-  gcloud compute ssh "${IAP_FLAG[@]}" "${GCLOUD_SSH_FLAGS[@]}" "$VM_NAME" \
+  gcloud compute ssh "${IAP_FLAG[@]+"${IAP_FLAG[@]}"}" "${GCLOUD_SSH_FLAGS[@]}" "$VM_NAME" \
     --zone="$ZONE" \
     --project="$PROJECT" \
     --verbosity=warning \

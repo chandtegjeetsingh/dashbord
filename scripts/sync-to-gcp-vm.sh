@@ -58,14 +58,14 @@ echo "    Размер файла: $(du -h "$TMP" | awk '{print $1}')"
 
 echo ""
 echo "━━ [3/4] Копирование на VM: ${VM_NAME}:/tmp/dashboard-sync.tgz ━━"
-if [[ "${#IAP_FLAG[@]}" -gt 0 ]]; then
+if [[ "${USE_IAP:-0}" == "1" ]]; then
   echo "    Режим: IAP (--tunnel-through-iap)"
 fi
 echo "    (точки = идёт передача, обычно несколько минут)"
 printf "    "
 set +e
 (
-  gcloud compute scp "${IAP_FLAG[@]}" "${GCLOUD_SCP_FLAGS[@]}" "$TMP" "${VM_NAME}:/tmp/dashboard-sync.tgz" \
+  gcloud compute scp "${IAP_FLAG[@]+"${IAP_FLAG[@]}"}" "${GCLOUD_SCP_FLAGS[@]}" "$TMP" "${VM_NAME}:/tmp/dashboard-sync.tgz" \
     --zone="$ZONE" \
     --project="$PROJECT" \
     --verbosity=warning
@@ -87,7 +87,7 @@ echo "    Заливка завершена."
 
 echo ""
 echo "━━ [4/4] Распаковка на VM в ~/${DASHBOARD_REMOTE_DIR} ━━"
-gcloud compute ssh "${IAP_FLAG[@]}" "${GCLOUD_SSH_FLAGS[@]}" "$VM_NAME" \
+gcloud compute ssh "${IAP_FLAG[@]+"${IAP_FLAG[@]}"}" "${GCLOUD_SSH_FLAGS[@]}" "$VM_NAME" \
   --zone="$ZONE" \
   --project="$PROJECT" \
   --verbosity=warning \
