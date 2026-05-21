@@ -1,0 +1,6 @@
+# Продакшен: HTTPS (Let's Encrypt) и прокси на nginx внутри контейнера web.
+# Домен должен указывать A-записью на IP ВМ; в GCP открыты tcp:80 и tcp:443.
+
+zakroma.cursordm.ru {
+    reverse_proxy web:80
+}

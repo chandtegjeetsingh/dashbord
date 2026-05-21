@@ -68,3 +68,12 @@ class PeriodDayMetric(Base):
     expense_orders_rub: Mapped[float] = mapped_column(Float, default=0.0)
     paymentout_purchase_rub: Mapped[float] = mapped_column(Float, default=0.0)
     raw_material_stock_rub: Mapped[float] = mapped_column(Float, default=0.0)
+
+
+class DashboardSetting(Base):
+    """Простые настройки дашборда (ключ → строковое значение)."""
+
+    __tablename__ = "dashboard_settings"
+
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="")

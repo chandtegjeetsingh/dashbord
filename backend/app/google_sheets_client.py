@@ -66,6 +66,13 @@ def _parse_sheet_date(value: str) -> date | None:
     return None
 
 
+def _sheet_cell_has_value(value: Any) -> bool:
+    """Пустая ячейка (None, пробелы, NBSP) — не значение; не смешивать с нулём."""
+    if value is None:
+        return False
+    return str(value).replace("\xa0", " ").strip() != ""
+
+
 def _parse_money(value: Any) -> float:
     """
     Парсинг суммы в числовое float.
@@ -271,6 +278,7 @@ def fetch_sheet_values() -> dict[str, list[dict[str, Any]]]:
 __all__ = [
     "date",
     "_parse_money",
+    "_sheet_cell_has_value",
     "_parse_sheet_date",
     "fetch_sheet_rows",
     "fetch_sheet_values",

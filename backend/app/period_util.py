@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import calendar
 import os
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 
@@ -20,10 +21,12 @@ def _tz() -> ZoneInfo:
 
 
 def default_period_dates() -> tuple[date, date]:
-    """По умолчанию: последние 30 календарных дней (включая сегодня, в TZ приложения)."""
+    """По умолчанию: текущий календарный месяц целиком (в TZ приложения)."""
     now = datetime.now(_tz())
-    end_d = now.date()
-    start_d = end_d - timedelta(days=29)
+    y, m = now.year, now.month
+    start_d = date(y, m, 1)
+    last = calendar.monthrange(y, m)[1]
+    end_d = date(y, m, last)
     return start_d, end_d
 
 

@@ -1,8 +1,8 @@
-# Скопируй на VM как /etc/caddy/Caddyfile и замени example.com на свой домен.
-# Caddy сам получит Let's Encrypt (HTTPS), прокси на Docker (web на localhost:8080).
+# Пример для docker-compose: сервис caddy (профиль with-https) и сервис web.
+# Скопируй как deploy/Caddyfile и замени домен.
 
 example.com {
-    reverse_proxy 127.0.0.1:8080
+    reverse_proxy web:80
 }
 
 # Если нужен и www:

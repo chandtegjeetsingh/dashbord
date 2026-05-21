@@ -40,6 +40,9 @@ usage() {
   Если IAP даёт 4003 / failed to connect to backend: во VPC нужно правило
   INGRESS tcp:22 с источника 35.235.240.0/20 (IAP), на цель — эту VM / её network tags.
 
+  HTTPS (профиль with-https): на ВМ в GCP откройте INGRESS tcp:80 и tcp:443
+  (например теги http-server / https-server на инстансе + default-allow-*).
+
 Режим «all» и флаги: DEPLOY_SKIP_SYNC=1, DEPLOY_SKIP_ENV=1, DEPLOY_SKIP_COMPOSE=1
 EOF
 }
@@ -93,7 +96,7 @@ run_up() {
     --zone="$ZONE" \
     --project="$PROJECT" \
     --verbosity=warning \
-    --command="set -euo pipefail; cd \"\$HOME/${DASHBOARD_REMOTE_DIR}\"; command -v docker >/dev/null 2>&1 || { echo 'Docker не установлен на VM.' >&2; exit 1; }; DOCKER_BUILDKIT=1 docker compose up -d --build; docker compose ps"
+    --command="set -euo pipefail; cd \"\$HOME/${DASHBOARD_REMOTE_DIR}\"; command -v docker >/dev/null 2>&1 || { echo 'Docker не установлен на VM.' >&2; exit 1; }; DOCKER_BUILDKIT=1 COMPOSE_PROFILES=with-https docker compose up -d --build; docker compose ps"
 }
 
 case "$STEP_LC" in
@@ -115,7 +118,8 @@ case "$STEP_LC" in
   up|compose)
     run_up
     echo ""
-    echo "Готово. Браузер: http://<внешний-IP-VM>:8080"
+    echo "Готово. Сайт: https://zakroma.cursordm.ru (Caddy + Let's Encrypt)"
+    echo "         или http://<внешний-IP-VM>:8080 если нужен прямой доступ к web"
     ;;
   all)
     echo "=== Полный деплой → ${VM_NAME} (${ZONE}, ${PROJECT}) ==="
@@ -146,7 +150,8 @@ case "$STEP_LC" in
     fi
 
     echo ""
-    echo "Готово. Браузер: http://<внешний-IP-VM>:8080"
+    echo "Готово. Сайт: https://zakroma.cursordm.ru (проверьте GCP: INGRESS tcp 80 и 443)"
+    echo "         резерв: http://<внешний-IP-VM>:8080"
     ;;
   *)
     echo "Неизвестная команда: $STEP" >&2

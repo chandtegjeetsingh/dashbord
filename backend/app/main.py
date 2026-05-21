@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
-from typing import Annotated, Optional
+from typing import Annotated, Dict, Optional
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Body, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
@@ -16,9 +17,14 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.database import get_db, init_db
-from app.google_sheets_client import _parse_money, fetch_sheet_rows
+from app.google_sheets_client import (
+    _parse_money,
+    _parse_sheet_date,
+    _sheet_cell_has_value,
+    fetch_sheet_rows,
+)
 from app.kpi_format import snapshot_history_row, snapshot_to_payload
-from app.models import DailySnapshot, PeriodDayMetric
+from app.models import DailySnapshot, DashboardSetting, PeriodDayMetric
 from app.period_util import default_period_dates
 from app.yougile_client import (
     YougileConfigError,
@@ -72,6 +78,163 @@ app.add_middleware(
 
 DbSession = Annotated[Session, Depends(get_db)]
 
+_COST_RATIO_PLAN_KEY = "cost_ratio_plan_percent"
+_DELIVERY_AVG_PLAN_KEY = "delivery_avg_plan_rub_per_kg"
+_LOGISTICS_SHARE_PLAN_KEY = "logistics_share_plan_percent"
+_TASKS_BONUS_PERCENT_KEY = "tasks_bonus_plan_percent"
+
+
+def _monthly_plan_settings_key(ym: str) -> str:
+    """ym в формате YYYY-MM → ключ в dashboard_settings."""
+    return f"monthly_plan_{ym.replace('-', '_')}"
+
+
+def _validate_plan_month(ym: str) -> str:
+    if not re.match(r"^\d{4}-\d{2}$", ym):
+        raise HTTPException(
+            status_code=400,
+            detail="month ожидается в формате YYYY-MM",
+        )
+    y, mo = int(ym[:4]), int(ym[5:7])
+    if mo < 1 or mo > 12:
+        raise HTTPException(status_code=400, detail="некорректный месяц")
+    return f"{y:04d}-{mo:02d}"
+
+
+def _month_from_monthly_plan_settings_key(key: str) -> Optional[str]:
+    """Ключ `monthly_plan_YYYY_MM` → `YYYY-MM` или None."""
+    m = re.match(r"^monthly_plan_(\d{4})_(\d{2})$", key)
+    if not m:
+        return None
+    y, mo = int(m.group(1)), int(m.group(2))
+    if mo < 1 or mo > 12:
+        return None
+    return f"{y:04d}-{mo:02d}"
+
+
+def _list_months_with_saved_plan_overrides(db: Session) -> list[str]:
+    """Месяцы YYYY-MM, для которых в БД есть непустой JSON переопределений."""
+    keys = db.scalars(
+        select(DashboardSetting.key).where(DashboardSetting.key.startswith("monthly_plan_"))
+    ).all()
+    yms: list[str] = []
+    for key in keys:
+        ym = _month_from_monthly_plan_settings_key(key)
+        if ym is None:
+            continue
+        if _load_monthly_plan_overrides(db, ym):
+            yms.append(ym)
+    yms.sort()
+    return yms
+
+
+def _iter_plan_months(month_a: str, month_b: str) -> list[str]:
+    """Последовательность YYYY-MM от month_a до month_b включительно (month_a ≤ month_b)."""
+    y1, m1 = int(month_a[:4]), int(month_a[5:7])
+    y2, m2 = int(month_b[:4]), int(month_b[5:7])
+    out: list[str] = []
+    y, m = y1, m1
+    while True:
+        out.append(f"{y:04d}-{m:02d}")
+        if y == y2 and m == m2:
+            break
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+    return out
+
+
+def _load_monthly_plan_overrides(db: Session, ym: str) -> dict:
+    key = _monthly_plan_settings_key(ym)
+    row = db.get(DashboardSetting, key)
+    if not row or not row.value.strip():
+        return {}
+    try:
+        data = json.loads(row.value)
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _save_monthly_plan_overrides(db: Session, ym: str, data: dict) -> None:
+    key = _monthly_plan_settings_key(ym)
+    row = db.get(DashboardSetting, key)
+    blob = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    if row is None:
+        db.add(DashboardSetting(key=key, value=blob))
+    else:
+        row.value = blob
+
+
+def _get_delivery_avg_global(db: Session) -> Optional[float]:
+    avg = _get_setting_float(db, _DELIVERY_AVG_PLAN_KEY)
+    if avg is None:
+        avg = _parse_percent_env(os.getenv("KPI_DELIVERY_AVG_PLAN_RUB_PER_KG", ""))
+    return avg
+
+
+def _get_logistics_share_global(db: Session) -> Optional[float]:
+    sh = _get_setting_float(db, _LOGISTICS_SHARE_PLAN_KEY)
+    if sh is None:
+        sh = _parse_percent_env(os.getenv("KPI_LOGISTICS_SHARE_PLAN_PERCENT", ""))
+    return sh
+
+
+def _get_tasks_bonus_global(db: Session) -> Optional[float]:
+    v = _get_setting_float(db, _TASKS_BONUS_PERCENT_KEY)
+    if v is None:
+        v = _parse_percent_env(os.getenv("KPI_TASKS_BONUS_PERCENT", ""))
+    return v
+
+
+def _parse_float_from_override(raw: object) -> Optional[float]:
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(str(raw).strip().replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_monthly_plan(db: Session, ym: str) -> Dict[str, object]:
+    """Планы для календарного месяца: переопределения из JSON + глобальные настройки/env."""
+    raw = _load_monthly_plan_overrides(db, ym)
+    cr_o = _parse_float_from_override(raw.get("cost_ratio_plan_percent"))
+    cr = cr_o if cr_o is not None else _get_cost_ratio_plan_percent(db)
+    da_o = _parse_float_from_override(raw.get("delivery_avg_rub_per_kg"))
+    da = da_o if da_o is not None else _get_delivery_avg_global(db)
+    ls_o = _parse_float_from_override(raw.get("logistics_share_plan_percent"))
+    ls = ls_o if ls_o is not None else _get_logistics_share_global(db)
+    tb_o = _parse_float_from_override(raw.get("tasks_bonus_percent"))
+    tb = tb_o if tb_o is not None else _get_tasks_bonus_global(db)
+    return {
+        "month": ym,
+        "cost_ratio_plan_percent": round(cr, 4) if cr is not None else None,
+        "delivery_avg_rub_per_kg": round(da, 2) if da is not None else None,
+        "logistics_share_plan_percent": round(ls, 4) if ls is not None else None,
+        "tasks_bonus_percent": round(tb, 2) if tb is not None else None,
+    }
+
+
+def _parse_percent_env(raw: str) -> Optional[float]:
+    t = raw.strip().replace(",", ".")
+    if not t:
+        return None
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def _get_cost_ratio_plan_percent(db: Session) -> Optional[float]:
+    row = db.get(DashboardSetting, _COST_RATIO_PLAN_KEY)
+    if row and row.value.strip():
+        v = _parse_percent_env(row.value)
+        if v is not None:
+            return v
+    return _parse_percent_env(os.getenv("KPI_COST_RATIO_PLAN_PERCENT", ""))
+
 
 def _parse_period(
     date_from: Optional[date],
@@ -89,6 +252,7 @@ def _parse_period(
 
 
 @app.get("/health")
+@app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
@@ -97,6 +261,285 @@ def health() -> dict[str, str]:
 def kpi_period_defaults() -> dict[str, str]:
     df, dt = default_period_dates()
     return {"date_from": df.isoformat(), "date_to": dt.isoformat()}
+
+
+@app.get("/api/settings/cost-ratio-plan")
+def get_cost_ratio_plan(db: DbSession) -> Dict[str, Optional[float]]:
+    """Целевой % (себестоимость отгрузок / сумма отгрузок * 100), задаётся на странице «План»."""
+    v = _get_cost_ratio_plan_percent(db)
+    return {"percent": round(v, 4) if v is not None else None}
+
+
+@app.put("/api/settings/cost-ratio-plan")
+def put_cost_ratio_plan(
+    db: DbSession,
+    body: Annotated[dict, Body(...)],
+) -> Dict[str, float]:
+    raw = body.get("percent")
+    if raw is None:
+        raise HTTPException(status_code=400, detail="Нужно поле percent")
+    try:
+        pct = float(str(raw).strip().replace(",", "."))
+    except (TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail="percent должен быть числом") from e
+    if pct < 0 or pct > 500:
+        raise HTTPException(
+            status_code=400,
+            detail="percent вне допустимого диапазона (0…500)",
+        )
+    row = db.get(DashboardSetting, _COST_RATIO_PLAN_KEY)
+    if row is None:
+        row = DashboardSetting(key=_COST_RATIO_PLAN_KEY, value=str(pct))
+        db.add(row)
+    else:
+        row.value = str(pct)
+    db.commit()
+    return {"percent": round(pct, 4)}
+
+
+def _get_setting_float(db: Session, key: str) -> Optional[float]:
+    row = db.get(DashboardSetting, key)
+    if row and row.value.strip():
+        v = _parse_percent_env(row.value)
+        if v is not None:
+            return v
+    return None
+
+
+def _put_setting_float(db: Session, key: str, value: float) -> None:
+    row = db.get(DashboardSetting, key)
+    if row is None:
+        db.add(DashboardSetting(key=key, value=str(value)))
+    else:
+        row.value = str(value)
+
+
+@app.get("/api/settings/delivery-logistics-plan")
+def get_delivery_logistics_plan(db: DbSession) -> Dict[str, Optional[float]]:
+    """Плановые: средняя доставка ₽/кг и доля логистики % (для бонуса и карточки «План»)."""
+    avg = _get_setting_float(db, _DELIVERY_AVG_PLAN_KEY)
+    if avg is None:
+        avg = _parse_percent_env(os.getenv("KPI_DELIVERY_AVG_PLAN_RUB_PER_KG", ""))
+    sh = _get_setting_float(db, _LOGISTICS_SHARE_PLAN_KEY)
+    if sh is None:
+        sh = _parse_percent_env(os.getenv("KPI_LOGISTICS_SHARE_PLAN_PERCENT", ""))
+    return {
+        "delivery_avg_rub_per_kg": round(avg, 2) if avg is not None else None,
+        "logistics_share_plan_percent": round(sh, 4) if sh is not None else None,
+    }
+
+
+@app.put("/api/settings/delivery-logistics-plan")
+def put_delivery_logistics_plan(
+    db: DbSession,
+    body: Annotated[dict, Body(...)],
+) -> Dict[str, Optional[float]]:
+    if "delivery_avg_rub_per_kg" in body:
+        raw = body.get("delivery_avg_rub_per_kg")
+        if raw is None or raw == "":
+            row = db.get(DashboardSetting, _DELIVERY_AVG_PLAN_KEY)
+            if row:
+                db.delete(row)
+        else:
+            try:
+                v = float(str(raw).strip().replace(",", "."))
+            except (TypeError, ValueError) as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail="delivery_avg_rub_per_kg должен быть числом",
+                ) from e
+            if v < 0 or v > 1e9:
+                raise HTTPException(status_code=400, detail="delivery_avg_rub_per_kg вне диапазона")
+            _put_setting_float(db, _DELIVERY_AVG_PLAN_KEY, v)
+    if "logistics_share_plan_percent" in body:
+        raw = body.get("logistics_share_plan_percent")
+        if raw is None or raw == "":
+            row = db.get(DashboardSetting, _LOGISTICS_SHARE_PLAN_KEY)
+            if row:
+                db.delete(row)
+        else:
+            try:
+                v = float(str(raw).strip().replace(",", "."))
+            except (TypeError, ValueError) as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail="logistics_share_plan_percent должен быть числом",
+                ) from e
+            if v < 0 or v > 500:
+                raise HTTPException(
+                    status_code=400,
+                    detail="logistics_share_plan_percent вне диапазона (0…500)",
+                )
+            _put_setting_float(db, _LOGISTICS_SHARE_PLAN_KEY, v)
+    db.commit()
+    return get_delivery_logistics_plan(db)
+
+
+@app.get("/api/settings/tasks-bonus-percent")
+def get_tasks_bonus_percent(db: DbSession) -> Dict[str, Optional[float]]:
+    """Процент бонуса за задачи и поручения: 0…10 % (на дашборде 10 % = 5 000 ₽)."""
+    v = _get_setting_float(db, _TASKS_BONUS_PERCENT_KEY)
+    if v is None:
+        v = _parse_percent_env(os.getenv("KPI_TASKS_BONUS_PERCENT", ""))
+    return {"percent": round(v, 2) if v is not None else None}
+
+
+@app.put("/api/settings/tasks-bonus-percent")
+def put_tasks_bonus_percent(
+    db: DbSession,
+    body: Annotated[dict, Body(...)],
+) -> Dict[str, float]:
+    raw = body.get("percent")
+    if raw is None:
+        raise HTTPException(status_code=400, detail="Нужно поле percent")
+    try:
+        pct = float(str(raw).strip().replace(",", "."))
+    except (TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail="percent должен быть числом") from e
+    if pct < 0 or pct > 10:
+        raise HTTPException(
+            status_code=400,
+            detail="percent вне допустимого диапазона (0…10)",
+        )
+    _put_setting_float(db, _TASKS_BONUS_PERCENT_KEY, pct)
+    db.commit()
+    return {"percent": round(pct, 2)}
+
+
+@app.get("/api/settings/monthly-plan")
+def get_monthly_plan(
+    db: DbSession,
+    month: Annotated[str, Query(description="Календарный месяц YYYY-MM (планы и расчёты сверху)")],
+) -> Dict[str, object]:
+    ym = _validate_plan_month(month.strip())
+    return _resolve_monthly_plan(db, ym)
+
+
+@app.get("/api/settings/monthly-plans-range")
+def get_monthly_plans_range(
+    db: DbSession,
+    month_from: Annotated[str, Query(description="Начало интервала YYYY-MM")],
+    month_to: Annotated[str, Query(description="Конец интервала YYYY-MM")],
+) -> Dict[str, object]:
+    """Итоговые планы по месяцам (как в GET monthly-plan) для каждого месяца в диапазоне."""
+    a = _validate_plan_month(month_from.strip())
+    b = _validate_plan_month(month_to.strip())
+    if a > b:
+        a, b = b, a
+    seq = _iter_plan_months(a, b)
+    if len(seq) > 48:
+        raise HTTPException(
+            status_code=400,
+            detail="Интервал не более 48 месяцев (сузьте month_from … month_to)",
+        )
+    months = [_resolve_monthly_plan(db, ym) for ym in seq]
+    return {"months": months}
+
+
+@app.get("/api/settings/monthly-plans-saved")
+def get_monthly_plans_saved(db: DbSession) -> Dict[str, object]:
+    """Только месяцы, для которых вы сохраняли план (есть запись переопределений в БД)."""
+    seq = _list_months_with_saved_plan_overrides(db)
+    months = [_resolve_monthly_plan(db, ym) for ym in seq]
+    return {"months": months}
+
+
+@app.put("/api/settings/monthly-plan")
+def put_monthly_plan(
+    db: DbSession,
+    body: Annotated[dict, Body(...)],
+) -> Dict[str, object]:
+    raw_m = body.get("month")
+    if not raw_m or not isinstance(raw_m, str):
+        raise HTTPException(status_code=400, detail="Нужно поле month (YYYY-MM)")
+    ym = _validate_plan_month(str(raw_m).strip())
+    cur = _load_monthly_plan_overrides(db, ym)
+
+    if "cost_ratio_plan_percent" in body:
+        v = body.get("cost_ratio_plan_percent")
+        if v is None or v == "":
+            cur.pop("cost_ratio_plan_percent", None)
+        else:
+            try:
+                pct = float(str(v).strip().replace(",", "."))
+            except (TypeError, ValueError) as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail="cost_ratio_plan_percent должен быть числом",
+                ) from e
+            if pct < 0 or pct > 500:
+                raise HTTPException(
+                    status_code=400,
+                    detail="cost_ratio_plan_percent вне 0…500",
+                )
+            cur["cost_ratio_plan_percent"] = pct
+
+    if "delivery_avg_rub_per_kg" in body:
+        v = body.get("delivery_avg_rub_per_kg")
+        if v is None or v == "":
+            cur.pop("delivery_avg_rub_per_kg", None)
+        else:
+            try:
+                x = float(str(v).strip().replace(",", "."))
+            except (TypeError, ValueError) as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail="delivery_avg_rub_per_kg должен быть числом",
+                ) from e
+            if x < 0 or x > 1e9:
+                raise HTTPException(
+                    status_code=400,
+                    detail="delivery_avg_rub_per_kg вне допустимого диапазона",
+                )
+            cur["delivery_avg_rub_per_kg"] = x
+
+    if "logistics_share_plan_percent" in body:
+        v = body.get("logistics_share_plan_percent")
+        if v is None or v == "":
+            cur.pop("logistics_share_plan_percent", None)
+        else:
+            try:
+                x = float(str(v).strip().replace(",", "."))
+            except (TypeError, ValueError) as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail="logistics_share_plan_percent должен быть числом",
+                ) from e
+            if x < 0 or x > 500:
+                raise HTTPException(
+                    status_code=400,
+                    detail="logistics_share_plan_percent вне 0…500",
+                )
+            cur["logistics_share_plan_percent"] = x
+
+    if "tasks_bonus_percent" in body:
+        v = body.get("tasks_bonus_percent")
+        if v is None or v == "":
+            cur.pop("tasks_bonus_percent", None)
+        else:
+            try:
+                pct = float(str(v).strip().replace(",", "."))
+            except (TypeError, ValueError) as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail="tasks_bonus_percent должен быть числом",
+                ) from e
+            if pct < 0 or pct > 10:
+                raise HTTPException(
+                    status_code=400,
+                    detail="tasks_bonus_percent вне 0…10",
+                )
+            cur["tasks_bonus_percent"] = pct
+
+    key = _monthly_plan_settings_key(ym)
+    row = db.get(DashboardSetting, key)
+    if not cur:
+        if row:
+            db.delete(row)
+    else:
+        _save_monthly_plan_overrides(db, ym, cur)
+    db.commit()
+    return _resolve_monthly_plan(db, ym)
 
 
 @app.get("/api/kpi/current")
@@ -315,6 +758,111 @@ def kpi_raw_material_in_transit() -> dict:
         total += _parse_money(r.get("E"))
 
     return {"sum_rub": round(total, 2)}
+
+
+def _is_delivery_cost_header_row(f_raw: object, i_raw: object) -> bool:
+    """Первая строка / шапка: в F — «дата», в I — подпись про стоимость за кг и т.п."""
+    f_txt = str(f_raw or "").strip().casefold().replace("ё", "е")
+    if not f_txt or len(f_txt) > 64:
+        return False
+    if "дата" in f_txt:
+        return True
+    i_txt = str(i_raw or "").strip().casefold().replace("ё", "е")
+    if "стоимость" in i_txt and "кг" in i_txt:
+        return True
+    return False
+
+
+@app.get("/api/kpi/delivery-cost-per-kg")
+def kpi_delivery_cost_per_kg(
+    date_from: Annotated[
+        Optional[date],
+        Query(description="Начало периода (включительно)"),
+    ] = None,
+    date_to: Annotated[
+        Optional[date],
+        Query(description="Конец периода (включительно)"),
+    ] = None,
+) -> Dict[str, object]:
+    """
+    По строкам с датой в F внутри периода [date_from, date_to]:
+    - средняя стоимость доставки за 1 кг — среднее по непустым I с числом ≥ 0;
+    - доля логистики — (сумма H) / (сумма E) × 100% (числа через _parse_money).
+    Таблица и лист — в .env.
+    """
+    p_from, p_to = _parse_period(date_from, date_to)
+    spreadsheet_id = os.getenv(
+        "GOOGLE_SHEETS_DELIVERY_COST_SPREADSHEET_ID",
+        "1cNLC0WZVIcHJWQbKYbpbedAdxANDze3VV12Op2F1O3E",
+    ).strip()
+    sheet_name = os.getenv(
+        "GOOGLE_SHEETS_DELIVERY_COST_SHEET_NAME",
+        os.getenv("GOOGLE_SHEETS_IN_TRANSIT_SHEET_NAME", "В ПУТИ"),
+    ).strip()
+
+    try:
+        rows = fetch_sheet_rows(
+            spreadsheet_id=spreadsheet_id,
+            sheet_name=sheet_name,
+            tq="select E, F, H, I",
+            prefer_formatted_for_cols=frozenset({"E", "F", "H", "I"}),
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Не удалось прочитать лист доставки через Google (gviz). "
+                "Проверьте GOOGLE_SHEETS_DELIVERY_COST_SHEET_NAME и доступ таблицы по ссылке. "
+                f"Детали: {e!s}"
+            ),
+        ) from e
+
+    costs: list[float] = []
+    sum_h = 0.0
+    sum_e = 0.0
+    rows_in_period = 0
+    h_values_count = 0
+    for r in rows:
+        f_raw = r.get("F")
+        i_raw = r.get("I")
+        h_raw = r.get("H")
+        if _is_delivery_cost_header_row(f_raw, i_raw):
+            continue
+        row_date = _parse_sheet_date(f_raw)
+        if row_date is None or row_date < p_from or row_date > p_to:
+            continue
+        rows_in_period += 1
+        val_h = _parse_money(h_raw)
+        val_e = _parse_money(r.get("E"))
+        sum_h += val_h
+        sum_e += val_e
+        if val_h != 0.0:
+            h_values_count += 1
+        if _sheet_cell_has_value(i_raw):
+            val_i = _parse_money(i_raw)
+            if val_i >= 0:
+                costs.append(val_i)
+
+    share_pct: Optional[float] = None
+    if sum_e > 0:
+        share_pct = round((sum_h / sum_e) * 100.0, 2)
+
+    if costs:
+        avg_rub = round(sum(costs) / len(costs), 2)
+    else:
+        avg_rub = None
+
+    return {
+        "avg_rub_per_kg": avg_rub,
+        "rows_used": len(costs),
+        "rows_in_period": rows_in_period,
+        "h_values_count": h_values_count,
+        "logistics_share_percent": share_pct,
+        "sum_h_rub": round(sum_h, 2),
+        "sum_e_rub": round(sum_e, 2),
+        "period_from": p_from.isoformat(),
+        "period_to": p_to.isoformat(),
+    }
 
 
 @app.get("/api/integrations/yougile/tasks")

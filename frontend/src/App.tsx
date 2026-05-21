@@ -1,7 +1,5 @@
-import { useCallback, useEffect, useId, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
-  Area,
-  AreaChart,
   CartesianGrid,
   Legend,
   Line,
@@ -12,6 +10,80 @@ import {
   YAxis,
 } from "recharts";
 import "./App.css";
+
+type MonthlyPlanResponse = {
+  month: string;
+  cost_ratio_plan_percent: number | null;
+  delivery_avg_rub_per_kg: number | null;
+  logistics_share_plan_percent: number | null;
+  tasks_bonus_percent: number | null;
+};
+
+/** Оклад и максимум бонуса за задачи (10 % → 5 000 ₽) — константы ТЗ. */
+const MONTHLY_SALARY_RUB = 50_000;
+const TASKS_BONUS_MAX_RUB = 5_000;
+/** Доставка + доля логистики: 1 из 2 по плану — 4 000 ₽; оба — 12 000 ₽ (факт ≤ план). */
+const DELIVERY_LOGISTICS_BONUS_ONE_RUB = 4_000;
+const DELIVERY_LOGISTICS_BONUS_BOTH_RUB = 12_000;
+
+const THEME_LIGHT_STORAGE_KEY = "dashboard-theme-light";
+
+function ThemeToggle({
+  lightTheme,
+  onLightThemeChange,
+}: {
+  lightTheme: boolean;
+  onLightThemeChange: (value: boolean) => void;
+}) {
+  return (
+    <div className="theme-toggle" role="group" aria-label="Тема оформления">
+      <span className="theme-toggle__hint" id="theme-toggle-label">
+        Тема
+      </span>
+      <div
+        className="theme-toggle__switch"
+        role="radiogroup"
+        aria-labelledby="theme-toggle-label"
+      >
+        <button
+          type="button"
+          role="radio"
+          aria-checked={!lightTheme}
+          className={`theme-toggle__btn${!lightTheme ? " is-active" : ""}`}
+          onClick={() => onLightThemeChange(false)}
+        >
+          Тёмная
+        </button>
+        <button
+          type="button"
+          role="radio"
+          aria-checked={lightTheme}
+          className={`theme-toggle__btn${lightTheme ? " is-active" : ""}`}
+          onClick={() => onLightThemeChange(true)}
+        >
+          Светлая
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Та же таблица, что по умолчанию у `/api/kpi/delivery-cost-per-kg` (можно заменить в .env). */
+const DELIVERY_LOGISTICS_SOURCE_SHEET_URL =
+  import.meta.env.VITE_DELIVERY_LOGISTICS_SHEET_URL?.trim() ||
+  "https://docs.google.com/spreadsheets/d/1cNLC0WZVIcHJWQbKYbpbedAdxANDze3VV12Op2F1O3E/edit";
+
+type DeliveryCostPerKgResponse = {
+  avg_rub_per_kg: number | null;
+  rows_used: number;
+  rows_in_period: number;
+  h_values_count: number;
+  logistics_share_percent: number | null;
+  sum_h_rub: number;
+  sum_e_rub: number;
+  period_from: string;
+  period_to: string;
+};
 
 type KpiPayload = {
   message: string | null;
@@ -57,11 +129,58 @@ type YougileTasksResponse = {
 
 function formatRub(n: number | null | undefined): string {
   if (n == null || Number.isNaN(n)) return "—";
+  const over10k = Math.abs(n) > 10_000;
   return new Intl.NumberFormat("ru-RU", {
     style: "currency",
     currency: "RUB",
-    maximumFractionDigits: 0,
+    minimumFractionDigits: 0,
+    maximumFractionDigits: over10k ? 0 : 1,
+  }).format(over10k ? Math.round(n) : n);
+}
+
+function formatRubPerKg(n: number | null | undefined): string {
+  if (n == null || Number.isNaN(n)) return "—";
+  const s = new Intl.NumberFormat("ru-RU", {
+    style: "currency",
+    currency: "RUB",
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 1,
   }).format(n);
+  return `${s}\u00a0/\u00a0кг`;
+}
+
+function formatPercent(n: number | null | undefined, digits = 1): string {
+  if (n == null || Number.isNaN(n)) return "—";
+  return `${n.toFixed(digits).replace(".", ",")} %`;
+}
+
+/** Логистика: факт ≤ план — норма. null — нельзя сравнить. */
+function logisticsFactNotWorseThanPlan(
+  fact: number | null,
+  plan: number | null,
+): boolean | null {
+  if (
+    fact == null ||
+    plan == null ||
+    Number.isNaN(fact) ||
+    Number.isNaN(plan) ||
+    !Number.isFinite(fact) ||
+    !Number.isFinite(plan)
+  ) {
+    return null;
+  }
+  return fact <= plan;
+}
+
+function logisticsFactPlanFactColClass(
+  ok: boolean | null,
+  opts?: { noData?: boolean },
+): string {
+  const base = "logistics-fact-plan-col logistics-fact-plan-col--fact";
+  if (opts?.noData) return `${base} logistics-fact-plan-col--fact-na`;
+  if (ok === true) return `${base} logistics-fact-plan-col--fact-ok`;
+  if (ok === false) return `${base} logistics-fact-plan-col--fact-warn`;
+  return `${base} logistics-fact-plan-col--fact-na`;
 }
 
 function formatShortDate(iso: string): string {
@@ -98,27 +217,105 @@ function formatAxisCompact(v: number): string {
     return `${(n / 1_000_000).toFixed(1).replace(".", ",")} млн`;
   }
   if (Math.abs(n) >= 1000) {
-    return `${Math.round(n / 1000)} тыс`;
+    const k = Math.round((n / 1000) * 10) / 10;
+    return `${k.toLocaleString("ru-RU", { minimumFractionDigits: 0, maximumFractionDigits: 1 })} тыс`;
   }
-  return String(Math.round(n));
+  const rounded = Math.round(n * 10) / 10;
+  return rounded.toLocaleString("ru-RU", { minimumFractionDigits: 0, maximumFractionDigits: 1 });
 }
+
+const DASH_DOT_LOADER_COUNT = 12;
 
 function OilFlaskLoader({ compact = false }: { compact?: boolean }) {
   return (
-    <div className={`oil-loader ${compact ? "compact" : ""}`} aria-live="polite">
-      <div className="oil-loader-drops" aria-hidden="true">
-        <span />
-        <span />
-        <span />
-      </div>
-      <div className="oil-flask" aria-hidden="true">
-        <div className="oil-fill" />
-        <div className="oil-flask-marks" aria-hidden="true">
-          <span className="oil-flask-tick oil-flask-tick-high" />
-          <span className="oil-flask-tick oil-flask-tick-low" />
-        </div>
+    <div
+      className={`dash-dot-loader${compact ? " dash-dot-loader--compact" : ""}`}
+      role="status"
+      aria-live="polite"
+      aria-label="Загрузка"
+    >
+      <div className="dash-dot-loader__ring" aria-hidden="true">
+        {Array.from({ length: DASH_DOT_LOADER_COUNT }, (_, i) => (
+          <span key={i} className="dash-dot-loader__dot" />
+        ))}
       </div>
     </div>
+  );
+}
+
+/** Один лёгкий индикатор для светлой страницы «План» (без «колбы»). */
+function PlanLuxeSpinner() {
+  return (
+    <div className="plan-luxe-spinner" role="status" aria-label="Загрузка">
+      <div className="plan-luxe-spinner__ring" aria-hidden="true" />
+    </div>
+  );
+}
+
+/** Единый заголовок «бонус»: звезда, подпись, градиентная линия. */
+function BonusPanelHeader({
+  subtitle,
+  compact = false,
+}: {
+  subtitle: string;
+  compact?: boolean;
+}) {
+  return (
+    <header
+      className={`bonus-panel-header${compact ? " bonus-panel-header--compact" : ""}`}
+    >
+      <div className="bonus-panel-header__top">
+        <span className="bonus-panel-header__star" aria-hidden="true">
+          ★
+        </span>
+        <div className="bonus-panel-header__text">
+          <span className="bonus-panel-header__title">Бонус</span>
+          <p className="bonus-panel-header__subtitle">{subtitle}</p>
+        </div>
+      </div>
+      <div className="bonus-panel-header__rule" aria-hidden="true" />
+    </header>
+  );
+}
+
+/** Подпись «Бонус N» в карточках вознаграждения — звезда как в bonus-panel-header. */
+function HonorariumBonusEyebrow({ label }: { label: string }) {
+  return (
+    <span className="honorarium-cell__eyebrow honorarium-cell__eyebrow--bonus">
+      <span className="honorarium-cell__bonus-star-badge" aria-hidden="true">
+        ★
+      </span>
+      {label}
+    </span>
+  );
+}
+
+/** Заголовок показателя в «Наша цель»: мишень + дротик (вместо звезды). */
+function PeriodGoalEyebrow({ label }: { label: string }) {
+  return (
+    <span className="honorarium-cell__eyebrow honorarium-cell__eyebrow--bonus">
+      <span className="period-plan-dart-badge" aria-hidden="true">
+        <svg className="period-plan-dart-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+          <circle cx="8.75" cy="12" r="5.2" fill="none" stroke="currentColor" strokeWidth="1.15" opacity="0.42" />
+          <circle cx="8.75" cy="12" r="3.1" fill="none" stroke="currentColor" strokeWidth="0.95" opacity="0.58" />
+          <circle cx="8.75" cy="12" r="1.35" fill="currentColor" opacity="0.82" />
+          <path
+            d="M12.8 10.5 20.5 12 12.8 13.5 11.4 12.35 16.2 12 11.4 11.65Z"
+            fill="currentColor"
+            opacity="0.95"
+          />
+          <path
+            d="M11.2 12H8.2"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.15"
+            strokeLinecap="round"
+            opacity="0.55"
+          />
+        </svg>
+      </span>
+      {label}
+    </span>
   );
 }
 
@@ -138,6 +335,18 @@ function toIsoDate(d: Date): string {
   const m = String(d.getMonth() + 1).padStart(2, "0");
   const day = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
+}
+
+/** Первый и последний день календарного месяца (локальная TZ браузера). Fallback без API. */
+function calendarMonthBoundsFromDate(d: Date): { from: string; to: string } {
+  const y = d.getFullYear();
+  const m = d.getMonth();
+  const last = new Date(y, m + 1, 0).getDate();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return {
+    from: `${y}-${pad(m + 1)}-01`,
+    to: `${y}-${pad(m + 1)}-${pad(last)}`,
+  };
 }
 
 function addDays(base: Date, days: number): Date {
@@ -192,16 +401,25 @@ function reorderCategoryLabelsFromItems(items: ReorderItem[]): string[] {
   return [...m.values()].sort((a, b) => a.localeCompare(b, "ru"));
 }
 
+/** Прямой URL API (Vite: `VITE_API_BASE=http://127.0.0.1:8000` в `frontend/.env`) или относительные `/api` через прокси. */
+function resolveApiUrl(url: string): string {
+  if (/^https?:\/\//i.test(url)) return url;
+  const raw = (import.meta.env.VITE_API_BASE as string | undefined)?.trim() ?? "";
+  const base = raw.replace(/\/$/, "");
+  return base ? `${base}${url}` : url;
+}
+
 /** Один раз читает body как текст, затем JSON — без SyntaxError на пустом ответе. */
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const r = await fetch(url, init);
+  const resolved = resolveApiUrl(url);
+  const r = await fetch(resolved, init);
   const text = await r.text();
   const trimmed = text.trim();
   if (!trimmed) {
     throw new Error(
       r.ok
-        ? `Пустой ответ сервера: ${url}`
-        : `HTTP ${r.status}: пустой ответ (${url}). Проверьте, что API запущен и прокси Vite указывает на порт 8000.`,
+        ? `Пустой ответ сервера: ${resolved}`
+        : `HTTP ${r.status}: пустой ответ (${resolved}). Запустите API (порт 8000) или задайте VITE_API_BASE.`,
     );
   }
   let data: unknown;
@@ -229,13 +447,539 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   return data as T;
 }
 
+type AppRoute = "dashboard" | "plan";
+
+function readAppRoute(): AppRoute {
+  const h = window.location.hash;
+  if (h.startsWith("#/plan")) return "plan";
+  return "dashboard";
+}
+
+function readMonthFromHash(): string | null {
+  const h = window.location.hash;
+  const q = h.indexOf("?");
+  if (q < 0) return null;
+  const m = new URLSearchParams(h.slice(q + 1)).get("month");
+  return m && /^\d{4}-\d{2}$/.test(m) ? m : null;
+}
+
+function planMonthIsoFromDateFrom(dateFrom: string): string {
+  if (dateFrom && dateFrom.length >= 7) return dateFrom.slice(0, 7);
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+
+/** Строка «План АПРЕЛЬ» для полоски заголовка. */
+function formatPlanMonthStrip(ym: string): string {
+  const [y, mo] = ym.split("-").map((x) => parseInt(x, 10));
+  if (!Number.isFinite(y) || !Number.isFinite(mo) || mo < 1 || mo > 12) {
+    return "План";
+  }
+  const d = new Date(y, mo - 1, 1);
+  const monthLong = d.toLocaleDateString("ru-RU", { month: "long" });
+  return `План ${monthLong.toLocaleUpperCase("ru-RU")}`;
+}
+
+function useHashRoute(): AppRoute {
+  const [route, setRoute] = useState<AppRoute>(() =>
+    typeof window !== "undefined" ? readAppRoute() : "dashboard",
+  );
+  useEffect(() => {
+    const onHash = () => setRoute(readAppRoute());
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+  return route;
+}
+
+function parseOptionalPlanNumber(raw: string): number | null | "bad" {
+  const t = raw.trim();
+  if (!t) return null;
+  const n = Number.parseFloat(t.replace(",", "."));
+  if (Number.isNaN(n)) return "bad";
+  return n;
+}
+
+/** Заголовок строки: «Март 2026 — плановые показатели». */
+function formatPlanMonthRowHeading(ym: string): string {
+  const [y, mo] = ym.split("-").map((x) => parseInt(x, 10));
+  if (!Number.isFinite(y) || !Number.isFinite(mo) || mo < 1 || mo > 12) {
+    return `${ym} — плановые показатели`;
+  }
+  const d = new Date(y, mo - 1, 1);
+  const monthLong = d.toLocaleDateString("ru-RU", { month: "long" });
+  const cap =
+    monthLong.charAt(0).toLocaleUpperCase("ru-RU") + monthLong.slice(1);
+  return `${cap} ${y} — плановые показатели`;
+}
+
+type MonthlyPlansSavedPayload = { months: MonthlyPlanResponse[] };
+
+function MonthlyPlansSavedSummary({
+  selectedYm,
+  onSelectMonth,
+  refreshNonce = 0,
+  className,
+  compact,
+  onLoadingChange,
+  suppressVisualLoader = false,
+}: {
+  selectedYm: string;
+  onSelectMonth: (ym: string) => void;
+  refreshNonce?: number;
+  className?: string;
+  compact?: boolean;
+  onLoadingChange?: (busy: boolean) => void;
+  suppressVisualLoader?: boolean;
+}) {
+  const [rows, setRows] = useState<MonthlyPlanResponse[]>([]);
+  const [err, setErr] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    onLoadingChange?.(true);
+    void fetchJson<MonthlyPlansSavedPayload>("/api/settings/monthly-plans-saved")
+      .then((r) => {
+        if (cancelled) return;
+        setRows(r.months);
+        setErr(null);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setErr(e instanceof Error ? e.message : "Ошибка загрузки списка");
+        setRows([]);
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setLoading(false);
+        onLoadingChange?.(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshNonce, onLoadingChange]);
+
+  const rootClass = [
+    "plan-months-summary",
+    compact ? "plan-months-summary--compact" : "",
+    className ?? "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  return (
+    <div className={rootClass}>
+      <p className="plan-months-summary-kicker">
+        {compact ? (
+          <>
+            Только месяцы, для которых в базе сохранён план. Строка — как считается бонус;
+            нажмите, чтобы подставить месяц в форму.
+          </>
+        ) : (
+          <>
+            Сюда попадают только месяцы, для которых вы хотя бы раз нажали «Сохранить» в этом
+            разделе (есть запись в базе). Цифры — итог с учётом общих настроек. Нажмите строку,
+            чтобы открыть месяц для правок.
+          </>
+        )}
+      </p>
+      {loading ? (
+        suppressVisualLoader ? (
+          <div className="plan-months-summary-placeholder" aria-hidden="true" />
+        ) : (
+          <div className="plan-months-summary-loader">
+            <OilFlaskLoader compact />
+          </div>
+        )
+      ) : err ? (
+        <p className="plan-months-summary-error" role="alert">
+          {err}
+        </p>
+      ) : rows.length === 0 ? (
+        <p className="plan-months-summary-empty" role="status">
+          Пока нет сохранённых планов по месяцам. Выберите месяц, заполните поля и нажмите
+          «Сохранить» — после этого месяц появится в этом списке.
+        </p>
+      ) : (
+        <ul className="plan-months-summary-list" role="list">
+          {rows.map((row) => (
+            <li key={row.month}>
+              <button
+                type="button"
+                className={`plan-month-row${
+                  row.month === selectedYm ? " plan-month-row--current" : ""
+                }`}
+                onClick={() => onSelectMonth(row.month)}
+              >
+                <span className="plan-month-row-title">{formatPlanMonthRowHeading(row.month)}</span>
+                <span className="plan-month-row-metrics">
+                  С/с {formatPercent(row.cost_ratio_plan_percent)} · Доставка{" "}
+                  {formatRubPerKg(row.delivery_avg_rub_per_kg)} · Логистика{" "}
+                  {formatPercent(row.logistics_share_plan_percent)} · Задачи{" "}
+                  {formatPercent(row.tasks_bonus_percent)}
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/** Пароль для входа на страницу «План» (только клиент; API не защищён). */
+const PLAN_PAGE_PASSWORD = "Plan";
+const PLAN_AUTH_SESSION_KEY = "hz_plan_unlocked";
+
+function readPlanAuthSession(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return sessionStorage.getItem(PLAN_AUTH_SESSION_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writePlanAuthSession(ok: boolean) {
+  try {
+    if (ok) sessionStorage.setItem(PLAN_AUTH_SESSION_KEY, "1");
+    else sessionStorage.removeItem(PLAN_AUTH_SESSION_KEY);
+  } catch {
+    /* приватный режим и т.п. */
+  }
+}
+
+function PlanPasswordGate({ onReloadDashboard }: { onReloadDashboard: () => void }) {
+  const [unlocked, setUnlocked] = useState(readPlanAuthSession);
+  const [password, setPassword] = useState("");
+  const [authError, setAuthError] = useState<string | null>(null);
+
+  const lockSession = useCallback(() => {
+    writePlanAuthSession(false);
+    setUnlocked(false);
+    setPassword("");
+    setAuthError(null);
+  }, []);
+
+  const trySubmit = (e: FormEvent) => {
+    e.preventDefault();
+    setAuthError(null);
+    if (password === PLAN_PAGE_PASSWORD) {
+      writePlanAuthSession(true);
+      setUnlocked(true);
+      setPassword("");
+    } else {
+      setAuthError("Неверный пароль");
+    }
+  };
+
+  if (!unlocked) {
+    return (
+      <div className="dashboard-main">
+        <section
+          className="panel plan-page-panel plan-auth-gate"
+          aria-labelledby="plan-auth-heading"
+        >
+          <h2 id="plan-auth-heading">Доступ к разделу «План»</h2>
+          <p className="plan-auth-lead">
+            Введите пароль, чтобы просматривать и редактировать плановые показатели.
+          </p>
+          <form onSubmit={trySubmit} className="plan-auth-form">
+            <label className="plan-page-field">
+              <span>Пароль</span>
+              <input
+                type="password"
+                name="plan-password"
+                autoComplete="current-password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className="plan-page-input"
+              />
+            </label>
+            {authError ? (
+              <p className="banner" role="alert">
+                {authError}
+              </p>
+            ) : null}
+            <div className="plan-page-actions">
+              <button type="submit" className="plan-save-btn">
+                Войти
+              </button>
+              <a href="#/" className="plan-back-link">
+                ← К дашборду
+              </a>
+            </div>
+          </form>
+        </section>
+      </div>
+    );
+  }
+
+  return (
+    <PlanSettingsPage
+      onReloadDashboard={onReloadDashboard}
+      onLockPlanSession={lockSession}
+    />
+  );
+}
+
+function PlanSettingsPage({
+  onReloadDashboard,
+  onLockPlanSession,
+}: {
+  onReloadDashboard: () => void;
+  onLockPlanSession?: () => void;
+}) {
+  const [planMonthIso, setPlanMonthIso] = useState(() =>
+    readMonthFromHash() ?? planMonthIsoFromDateFrom(""),
+  );
+  const [pct, setPct] = useState("");
+  const [delPlanAvg, setDelPlanAvg] = useState("");
+  const [delPlanShare, setDelPlanShare] = useState("");
+  const [tasksBonusPct, setTasksBonusPct] = useState("0");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [plansListRefresh, setPlansListRefresh] = useState(0);
+  const [summaryBusy, setSummaryBusy] = useState(true);
+  const planBodyBusy = summaryBusy || loading;
+
+  useEffect(() => {
+    const onHash = () => {
+      const m = readMonthFromHash();
+      if (m) setPlanMonthIso(m);
+    };
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
+  useEffect(() => {
+    setLoading(true);
+    const q = new URLSearchParams({ month: planMonthIso }).toString();
+    void fetchJson<MonthlyPlanResponse>(`/api/settings/monthly-plan?${q}`)
+      .then((mp) => {
+        if (mp.cost_ratio_plan_percent != null) setPct(String(mp.cost_ratio_plan_percent));
+        else setPct("");
+        if (mp.delivery_avg_rub_per_kg != null) {
+          setDelPlanAvg(String(mp.delivery_avg_rub_per_kg));
+        } else setDelPlanAvg("");
+        if (mp.logistics_share_plan_percent != null) {
+          setDelPlanShare(String(mp.logistics_share_plan_percent));
+        } else setDelPlanShare("");
+        if (mp.tasks_bonus_percent != null) setTasksBonusPct(String(mp.tasks_bonus_percent));
+        else setTasksBonusPct("0");
+        setMsg(null);
+      })
+      .catch((e) => {
+        setMsg(e instanceof Error ? e.message : "Ошибка загрузки");
+      })
+      .finally(() => setLoading(false));
+  }, [planMonthIso]);
+
+  const savePlanSettings = async () => {
+    setSaving(true);
+    setMsg(null);
+    try {
+      const num = Number.parseFloat(pct.replace(",", "."));
+      if (Number.isNaN(num)) throw new Error("План по себестоимости: введите число");
+      if (num < 0 || num > 500) throw new Error("План по себестоимости: допустимо 0…500 %");
+
+      const avg = parseOptionalPlanNumber(delPlanAvg);
+      const sh = parseOptionalPlanNumber(delPlanShare);
+      if (avg === "bad" || sh === "bad") {
+        throw new Error("Доставка / логистика: введите числа или оставьте поле пустым для сброса");
+      }
+
+      const rawTasks = tasksBonusPct.trim() || "0";
+      const tasksN = Number.parseFloat(rawTasks.replace(",", "."));
+      if (Number.isNaN(tasksN)) throw new Error("Бонус за задачи: введите число от 0 до 10");
+      if (tasksN < 0 || tasksN > 10) throw new Error("Бонус за задачи: допустимо 0…10 %");
+
+      await fetchJson<MonthlyPlanResponse>("/api/settings/monthly-plan", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          month: planMonthIso,
+          cost_ratio_plan_percent: num,
+          delivery_avg_rub_per_kg: avg,
+          logistics_share_plan_percent: sh,
+          tasks_bonus_percent: tasksN,
+        }),
+      });
+      setPlansListRefresh((n) => n + 1);
+      onReloadDashboard();
+    } catch (e) {
+      setMsg(e instanceof Error ? e.message : "Не сохранилось");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="dashboard-main">
+      <section className="panel plan-page-panel">
+        <h2>Плановые показатели</h2>
+        <p className="plan-page-month-strip">{formatPlanMonthStrip(planMonthIso)}</p>
+        <label className="plan-page-field plan-page-field--month">
+          <span>Месяц планов (YYYY-MM)</span>
+          <input
+            type="month"
+            value={planMonthIso}
+            onChange={(e) => {
+              const v = e.target.value;
+              if (!v) return;
+              setPlanMonthIso(v);
+              window.location.hash = `#/plan?month=${encodeURIComponent(v)}`;
+            }}
+            className="plan-page-input"
+          />
+        </label>
+        <div
+          className={`plan-page-body-stack${planBodyBusy ? " plan-page-body-stack--busy" : ""}`}
+        >
+          {planBodyBusy ? (
+            <div className="plan-page-unified-loader">
+              <PlanLuxeSpinner />
+            </div>
+          ) : null}
+          <div className={`plan-page-body-stack-inner${planBodyBusy ? " is-busy" : ""}`}>
+            <MonthlyPlansSavedSummary
+              selectedYm={planMonthIso}
+              onSelectMonth={(ym) => {
+                setPlanMonthIso(ym);
+                window.location.hash = `#/plan?month=${encodeURIComponent(ym)}`;
+              }}
+              refreshNonce={plansListRefresh}
+              onLoadingChange={setSummaryBusy}
+              suppressVisualLoader
+            />
+            {!loading ? (
+              <>
+            {msg && (
+              <p className="banner" role="alert">
+                {msg}
+              </p>
+            )}
+            <h3 className="plan-page-h3">Доля себестоимости к отгрузкам</h3>
+            <label className="plan-page-field">
+              <span>План, %</span>
+              <input
+                type="number"
+                step="0.01"
+                min={0}
+                max={500}
+                value={pct}
+                onChange={(e) => setPct(e.target.value)}
+                className="plan-page-input"
+              />
+            </label>
+
+            <h3 className="plan-page-h3 plan-page-h3--spaced">Доставка и логистика</h3>
+            <label className="plan-page-field">
+              <span>План: средняя стоимость доставки, ₽/кг</span>
+              <input
+                type="number"
+                step="0.01"
+                min={0}
+                value={delPlanAvg}
+                onChange={(e) => setDelPlanAvg(e.target.value)}
+                className="plan-page-input"
+              />
+            </label>
+            <label className="plan-page-field plan-page-field--tight">
+              <span>План: доля логистики, %</span>
+              <input
+                type="number"
+                step="0.01"
+                min={0}
+                max={500}
+                value={delPlanShare}
+                onChange={(e) => setDelPlanShare(e.target.value)}
+                className="plan-page-input"
+              />
+            </label>
+
+            <h3 className="plan-page-h3 plan-page-h3--spaced">Бонус за задачи</h3>
+            <label className="plan-page-field">
+              <span>Процент бонуса за задачи и поручения, %</span>
+              <input
+                type="number"
+                step="0.1"
+                min={0}
+                max={10}
+                value={tasksBonusPct}
+                onChange={(e) => setTasksBonusPct(e.target.value)}
+                className="plan-page-input"
+              />
+            </label>
+            <div className="plan-page-actions">
+              <button
+                type="button"
+                className="plan-save-btn"
+                onClick={() => void savePlanSettings()}
+                disabled={saving}
+              >
+                {saving ? "Сохранение…" : "Сохранить"}
+              </button>
+              {onLockPlanSession ? (
+                <button
+                  type="button"
+                  className="plan-lock-session-btn"
+                  onClick={onLockPlanSession}
+                >
+                  Выйти из раздела
+                </button>
+              ) : null}
+              <a href="#/" className="plan-back-link">
+                ← К дашборду
+              </a>
+            </div>
+              </>
+            ) : null}
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 export default function App() {
+  const route = useHashRoute();
+  const [lightTheme, setLightTheme] = useState(() => {
+    if (typeof window === "undefined") return false;
+    try {
+      return window.localStorage.getItem(THEME_LIGHT_STORAGE_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(THEME_LIGHT_STORAGE_KEY, lightTheme ? "1" : "0");
+    } catch {
+      /* приватный режим */
+    }
+  }, [lightTheme]);
+
+  const dashboardSurfaceClass = lightTheme ? "dashboard dashboard--light" : "dashboard";
+
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
+  /** Календарный месяц для планов и верхних бонусов (по дате «От»). */
+  const planMonthIso = useMemo(() => planMonthIsoFromDateFrom(dateFrom), [dateFrom]);
   const [defaultsLoaded, setDefaultsLoaded] = useState(false);
   const [kpi, setKpi] = useState<KpiPayload | null>(null);
+  const [planPercent, setPlanPercent] = useState<number | null>(null);
+  const [planDeliveryAvgRubPerKg, setPlanDeliveryAvgRubPerKg] = useState<
+    number | null
+  >(null);
+  const [planLogisticsSharePercent, setPlanLogisticsSharePercent] = useState<
+    number | null
+  >(null);
   const [dailyDays, setDailyDays] = useState<DailyBreakdownDay[]>([]);
-  const [syncDetail, setSyncDetail] = useState<string | null>(null);
   const [periodMode, setPeriodMode] = useState<PeriodMode>("month");
   const [reorderItems, setReorderItems] = useState<ReorderItem[]>([]);
   /** Все уникальные категории из столбца C листа (с бэкенда), не только строки «к заказу». */
@@ -248,12 +992,22 @@ export default function App() {
   const [rawMaterialInTransitError, setRawMaterialInTransitError] = useState<
     string | null
   >(null);
+  const [deliveryAvgRubPerKg, setDeliveryAvgRubPerKg] = useState<number | null>(null);
+  const [deliveryRowsUsed, setDeliveryRowsUsed] = useState(0);
+  const [deliveryRowsInPeriod, setDeliveryRowsInPeriod] = useState(0);
+  const [deliveryHValuesCount, setDeliveryHValuesCount] = useState(0);
+  const [logisticsSharePercent, setLogisticsSharePercent] = useState<number | null>(null);
+  const [deliveryError, setDeliveryError] = useState<string | null>(null);
   const [yougileTasks, setYougileTasks] = useState<YougileTask[]>([]);
   const [yougileLoading, setYougileLoading] = useState(false);
   const [yougileError, setYougileError] = useState<string | null>(null);
   const [yougileEmployee, setYougileEmployee] = useState("Татьяна Живетьева");
-  const chartGradKey = `cg${useId().replace(/:/g, "")}`;
-
+  /** 0…10 % → до 5 000 ₽ на полосе сверху. */
+  const [tasksBonusPlanPercent, setTasksBonusPlanPercent] = useState<number | null>(
+    null,
+  );
+  /** Защита от гонок: применяем только ответ самого свежего запроса по диапазону дат. */
+  const latestKpiRequestIdRef = useRef(0);
   useEffect(() => {
     void fetchJson<{ date_from: string; date_to: string }>(
       "/api/kpi/period-defaults",
@@ -264,10 +1018,9 @@ export default function App() {
         setDefaultsLoaded(true);
       })
       .catch(() => {
-        const t = new Date();
-        const from = addDays(t, -29);
-        setDateFrom(from.toISOString().slice(0, 10));
-        setDateTo(t.toISOString().slice(0, 10));
+        const { from, to } = calendarMonthBoundsFromDate(new Date());
+        setDateFrom(from);
+        setDateTo(to);
         setDefaultsLoaded(true);
       });
   }, []);
@@ -293,22 +1046,46 @@ export default function App() {
 
   const loadKpiOnly = useCallback(async () => {
     if (!dateFrom || !dateTo) return;
+    const requestId = ++latestKpiRequestIdRef.current;
     const q = periodQuery(dateFrom, dateTo);
     setRawMaterialInTransitError(null);
+    setDeliveryError(null);
     const transitP = fetchJson<{ sum_rub: number }>("/api/kpi/raw-material-in-transit")
       .then((x) => ({ ok: true as const, sum: x.sum_rub }))
       .catch((e) => ({
         ok: false as const,
         err: e instanceof Error ? e.message : "Ошибка загрузки «Сырьё в пути»",
       }));
-    const [kc, kd, rr, transitRes] = await Promise.all([
+    const ym = planMonthIsoFromDateFrom(dateFrom);
+    const monthlyPlanP = fetchJson<MonthlyPlanResponse>(
+      `/api/settings/monthly-plan?${new URLSearchParams({ month: ym }).toString()}`,
+    )
+      .then((x) => ({ ok: true as const, data: x }))
+      .catch(() => ({ ok: false as const }));
+
+    const deliveryP = fetchJson<DeliveryCostPerKgResponse>(
+      `/api/kpi/delivery-cost-per-kg?${q}`,
+    )
+      .then((x) => ({ ok: true as const, data: x }))
+      .catch((e) => ({
+        ok: false as const,
+        err:
+          e instanceof Error
+            ? e.message
+            : "Не удалось загрузить стоимость доставки",
+      }));
+
+    const [kc, kd, rr, transitRes, monthlyPlanRes, deliveryRes] = await Promise.all([
       fetchJson<KpiPayload>(`/api/kpi/current?${q}`),
       fetchJson<{ days: DailyBreakdownDay[] }>(`/api/kpi/daily-breakdown?${q}`),
       fetchJson<{ items: ReorderItem[]; categories?: string[] }>(
         "/api/kpi/reorder-raw-materials",
       ),
       transitP,
+      monthlyPlanP,
+      deliveryP,
     ]);
+    if (requestId !== latestKpiRequestIdRef.current) return;
     setKpi(kc);
     setDailyDays(kd.days || []);
     const items = rr.items || [];
@@ -326,6 +1103,28 @@ export default function App() {
       setRawMaterialInTransitRub(null);
       setRawMaterialInTransitError(transitRes.err);
     }
+    if (monthlyPlanRes.ok) {
+      const mp = monthlyPlanRes.data;
+      setPlanPercent(mp.cost_ratio_plan_percent ?? null);
+      setPlanDeliveryAvgRubPerKg(mp.delivery_avg_rub_per_kg ?? null);
+      setPlanLogisticsSharePercent(mp.logistics_share_plan_percent ?? null);
+      setTasksBonusPlanPercent(mp.tasks_bonus_percent ?? null);
+    }
+    if (deliveryRes.ok) {
+      setDeliveryAvgRubPerKg(deliveryRes.data.avg_rub_per_kg ?? null);
+      setDeliveryRowsUsed(deliveryRes.data.rows_used ?? 0);
+      setDeliveryRowsInPeriod(deliveryRes.data.rows_in_period ?? 0);
+      setDeliveryHValuesCount(deliveryRes.data.h_values_count ?? 0);
+      setLogisticsSharePercent(deliveryRes.data.logistics_share_percent ?? null);
+      setDeliveryError(null);
+    } else {
+      setDeliveryAvgRubPerKg(null);
+      setDeliveryRowsUsed(0);
+      setDeliveryRowsInPeriod(0);
+      setDeliveryHValuesCount(0);
+      setLogisticsSharePercent(null);
+      setDeliveryError(deliveryRes.err);
+    }
   }, [dateFrom, dateTo]);
 
   useEffect(() => {
@@ -335,23 +1134,23 @@ export default function App() {
 
   const syncFromSheets = useCallback(async () => {
     if (!dateFrom || !dateTo) return;
-    setSyncDetail(null);
     const q = periodQuery(dateFrom, dateTo);
+    // Сначала показываем снимок из БД (быстро), иначе экран висит на POST /api/sync
+    // (Google Sheets может отвечать очень долго).
+    try {
+      await loadKpiOnly();
+    } catch {
+      /* ignore */
+    }
     try {
       await fetchJson<KpiPayload>(`/api/sync?${q}`, { method: "POST" });
-    } catch (e) {
-      setSyncDetail(
-        e instanceof Error ? e.message : "Ошибка синхронизации с Google Sheets",
-      );
+    } catch {
+      /* ignore */
     }
     try {
       await loadKpiOnly();
-    } catch (e) {
-      setSyncDetail(
-        (prev) =>
-          prev ??
-          (e instanceof Error ? e.message : "Не удалось загрузить KPI"),
-      );
+    } catch {
+      /* ignore */
     }
   }, [dateFrom, dateTo, loadKpiOnly]);
 
@@ -360,7 +1159,7 @@ export default function App() {
 
     // Автосинк при смене диапазона (с debounce).
     const t = window.setTimeout(() => {
-      void syncFromSheets().catch((e) => setSyncDetail(String(e)));
+      void syncFromSheets();
     }, 450);
 
     return () => window.clearTimeout(t);
@@ -375,17 +1174,6 @@ export default function App() {
     [dailyDays],
   );
 
-  const hasDailyActivity = useMemo(
-    () =>
-      dailyDays.some(
-        (d) =>
-          d.shipments > 0 ||
-          d.cost_shipped > 0 ||
-          d.purchases > 0 ||
-          d.raw_material_stock > 0,
-      ),
-    [dailyDays],
-  );
   const hasRawMaterialActivity = useMemo(
     () => dailyDays.some((d) => d.raw_material_stock > 0),
     [dailyDays],
@@ -406,8 +1194,12 @@ export default function App() {
     return [Math.max(0, min - pad), max + pad];
   }, [dailyDays]);
 
-  const shipmentsYAxisDomain = useMemo<[number, number]>(() => {
-    const max = Math.max(0, ...dailyDays.map((d) => d.shipments));
+  /** Общая шкала ₽ для отгрузок, себестоимости отгрузок и закупок по дням. */
+  const salesMixYAxisDomain = useMemo<[number, number]>(() => {
+    const max = Math.max(
+      0,
+      ...dailyDays.flatMap((d) => [d.shipments, d.cost_shipped, d.purchases]),
+    );
     if (max === 0) return [0, 100];
     const pad = Math.max(1, Math.round(max * 0.08));
     return [0, max + pad];
@@ -495,6 +1287,105 @@ export default function App() {
     [dateFrom, dateTo, periodMode],
   );
 
+  const costRatioFactPercent = useMemo(() => {
+    const s = kpi?.shipments_sum;
+    const c = kpi?.cost_shipped_sum;
+    if (
+      s == null ||
+      c == null ||
+      !Number.isFinite(s) ||
+      !Number.isFinite(c) ||
+      s <= 0
+    ) {
+      return null;
+    }
+    return (c / s) * 100;
+  }, [kpi]);
+
+  /** (План% − Факт%) / 100 × сумма отгрузок × 0,2 — как в ТЗ. */
+  const costRatioBonusRub = useMemo(() => {
+    const s = kpi?.shipments_sum;
+    if (
+      planPercent == null ||
+      costRatioFactPercent == null ||
+      s == null ||
+      !Number.isFinite(s) ||
+      s <= 0
+    ) {
+      return null;
+    }
+    return ((planPercent - costRatioFactPercent) / 100) * s * 0.2;
+  }, [kpi, planPercent, costRatioFactPercent]);
+
+  /** План выполнен, если факт ≤ план (оба показателя «чем меньше, тем лучше»). */
+  const deliveryLogisticsBonusRub = useMemo(() => {
+    const pAvg = planDeliveryAvgRubPerKg;
+    const fAvg = deliveryAvgRubPerKg;
+    const pSh = planLogisticsSharePercent;
+    const fSh = logisticsSharePercent;
+    const hasAvg =
+      pAvg != null && fAvg != null && Number.isFinite(pAvg) && Number.isFinite(fAvg);
+    const hasShare =
+      pSh != null && fSh != null && Number.isFinite(pSh) && Number.isFinite(fSh);
+    const nApplicable = (hasAvg ? 1 : 0) + (hasShare ? 1 : 0);
+    if (nApplicable === 0) return null;
+    const metAvg = hasAvg && fAvg <= pAvg;
+    const metShare = hasShare && fSh <= pSh;
+    const nMet = (metAvg ? 1 : 0) + (metShare ? 1 : 0);
+    if (nMet === 0) return 0;
+    if (nApplicable === 2 && nMet === 2) return DELIVERY_LOGISTICS_BONUS_BOTH_RUB;
+    return DELIVERY_LOGISTICS_BONUS_ONE_RUB;
+  }, [
+    planDeliveryAvgRubPerKg,
+    planLogisticsSharePercent,
+    deliveryAvgRubPerKg,
+    logisticsSharePercent,
+  ]);
+
+  /** 0…10 % от максимума 5 000 ₽ (линейно). */
+  const tasksBonusRubFromPlan = useMemo(() => {
+    const p = tasksBonusPlanPercent ?? 0;
+    const clamped = Math.min(10, Math.max(0, p));
+    return (clamped / 10) * TASKS_BONUS_MAX_RUB;
+  }, [tasksBonusPlanPercent]);
+
+  /** Оклад + бонусы (недоступные бонусы в сумме как 0). */
+  const compensationTotalRub = useMemo(() => {
+    const bc = costRatioBonusRub;
+    const bl = deliveryLogisticsBonusRub;
+    const nC = bc != null && Number.isFinite(bc) ? bc : 0;
+    const nL = bl != null && Number.isFinite(bl) ? bl : 0;
+    return MONTHLY_SALARY_RUB + nC + nL + tasksBonusRubFromPlan;
+  }, [costRatioBonusRub, deliveryLogisticsBonusRub, tasksBonusRubFromPlan]);
+
+  const tasksBonusPercentLabel = (tasksBonusPlanPercent ?? 0).toLocaleString("ru-RU", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 1,
+  });
+
+  /** Для себестоимости к отгрузкам норма та же: факт ≤ план. */
+  const costRatioVsPlanOk = useMemo((): boolean | null => {
+    if (
+      planPercent == null ||
+      costRatioFactPercent == null ||
+      !Number.isFinite(planPercent) ||
+      !Number.isFinite(costRatioFactPercent)
+    ) {
+      return null;
+    }
+    return costRatioFactPercent <= planPercent;
+  }, [planPercent, costRatioFactPercent]);
+
+  const deliveryAvgVsPlanOk = useMemo(
+    () => logisticsFactNotWorseThanPlan(deliveryAvgRubPerKg, planDeliveryAvgRubPerKg),
+    [deliveryAvgRubPerKg, planDeliveryAvgRubPerKg],
+  );
+
+  const logisticsShareVsPlanOk = useMemo(
+    () => logisticsFactNotWorseThanPlan(logisticsSharePercent, planLogisticsSharePercent),
+    [logisticsSharePercent, planLogisticsSharePercent],
+  );
+
   const { urgentTasks, overdueTasks } = useMemo(() => {
     const now = Date.now();
     const uniqueOpen = new Map<string, YougileTask>();
@@ -532,8 +1423,9 @@ export default function App() {
     return { urgentTasks: urgent, overdueTasks: overdue };
   }, [yougileTasks]);
 
+  if (route === "plan") {
   return (
-    <div className="dashboard">
+    <div className={dashboardSurfaceClass}>
       <header className="dash-header">
         <div className="dash-header-inner">
           <div className="topbar">
@@ -541,14 +1433,55 @@ export default function App() {
               <h1>Дашборд хозяйки закромов</h1>
               <p className="brand-tagline">Сырьё · закупки · отгрузки · задачи</p>
             </div>
+            <div className="topbar__actions">
+              <ThemeToggle lightTheme={lightTheme} onLightThemeChange={setLightTheme} />
+              <nav className="dash-nav" aria-label="Разделы">
+                <a href="#/" className="dash-nav-link">
+                  Дашборд
+                </a>
+                <a href="#/plan" className="dash-nav-link dash-nav-link--active">
+                  План
+                </a>
+              </nav>
+            </div>
+          </div>
+        </div>
+        </header>
+        <PlanPasswordGate onReloadDashboard={() => void loadKpiOnly()} />
+      </div>
+    );
+  }
+
+  return (
+    <div className={dashboardSurfaceClass}>
+      <header className="dash-header">
+        <div className="dash-header-inner">
+          <div className="topbar">
+            <div className="brand">
+              <h1>Дашборд хозяйки закромов</h1>
+              <p className="brand-tagline">Сырьё · закупки · отгрузки · задачи</p>
+            </div>
+            <div className="topbar__actions">
+              <ThemeToggle lightTheme={lightTheme} onLightThemeChange={setLightTheme} />
+              <nav className="dash-nav" aria-label="Разделы">
+                <a href="#/" className="dash-nav-link dash-nav-link--active">
+                  Дашборд
+                </a>
+                <a href="#/plan" className="dash-nav-link">
+                  План
+                </a>
+              </nav>
+            </div>
           </div>
         </div>
       </header>
 
       <div className="dashboard-main">
       <section className="filter-bar panel">
+        <div className="filter-bar-inner">
         <div className="period-nav panel">
             <div className="period-range">
+              <div className="period-range-dates">
               <label className="period-date-field">
                 <span>От</span>
                 <input
@@ -568,6 +1501,7 @@ export default function App() {
                   className="period-date-input"
                 />
               </label>
+              </div>
             </div>
             <div className="period-nav-top">
               <span className="period-nav-label">Период:</span>
@@ -581,6 +1515,195 @@ export default function App() {
               <button type="button" className="period-arrow" onClick={() => shiftPeriod(-1)} aria-label="Предыдущий период">◀</button>
               <span className="period-nav-title">{periodNavLabel}</span>
               <button type="button" className="period-arrow" onClick={() => shiftPeriod(1)} aria-label="Следующий период">▶</button>
+            </div>
+            <div
+              className="honorarium-board period-plan-strip"
+              aria-label="План и факт по месяцу даты «От»"
+            >
+              <header className="honorarium-board__intro">
+                <div className="honorarium-board__intro-text">
+                  <h3 className="honorarium-board__title">Наша цель</h3>
+                </div>
+              </header>
+              <ul className="honorarium-matrix period-plan-rows">
+                <li className="honorarium-cell honorarium-cell--bonus" aria-label="Себестоимость: факт и план">
+                  <PeriodGoalEyebrow label="СЕБЕСТОИМОСТЬ" />
+                  <p className="honorarium-cell__amount period-plan-amount-block">
+                    <span
+                      className={[
+                        "period-plan-fact",
+                        costRatioVsPlanOk === true
+                          ? "period-plan-fact--ok"
+                          : costRatioVsPlanOk === false
+                            ? "period-plan-fact--warn"
+                            : "period-plan-fact--na",
+                      ].join(" ")}
+                      title={
+                        costRatioVsPlanOk === true
+                          ? "В норме: факт не выше плана"
+                          : costRatioVsPlanOk === false
+                            ? "Выше плана"
+                            : "Недостаточно данных для сравнения"
+                      }
+                    >
+                      {formatPercent(costRatioFactPercent)}
+                    </span>
+                    <span className="period-plan-sep" aria-hidden="true">
+                      /
+                    </span>
+                    <span className="period-plan-target">{formatPercent(planPercent)}</span>
+                  </p>
+                  <p className="honorarium-cell__hint">Факт сейчас · цель (план) на месяц</p>
+                </li>
+                <li className="honorarium-cell honorarium-cell--bonus" aria-label="Стоимость доставки 1 кг: факт и план">
+                  <PeriodGoalEyebrow label="ДОСТАВКА 1 КГ" />
+                  <p className="honorarium-cell__amount period-plan-amount-block">
+                    <span
+                      className={[
+                        "period-plan-fact",
+                        deliveryError
+                          ? "period-plan-fact--na"
+                          : deliveryAvgVsPlanOk === true
+                            ? "period-plan-fact--ok"
+                            : deliveryAvgVsPlanOk === false
+                              ? "period-plan-fact--warn"
+                              : "period-plan-fact--na",
+                      ].join(" ")}
+                      title={
+                        deliveryError
+                          ? deliveryError
+                          : deliveryAvgVsPlanOk === true
+                            ? "В норме: факт не выше плана"
+                            : deliveryAvgVsPlanOk === false
+                              ? "Выше плана"
+                              : "Недостаточно данных для сравнения"
+                      }
+                    >
+                      {deliveryError ? "—" : formatRubPerKg(deliveryAvgRubPerKg)}
+                    </span>
+                    <span className="period-plan-sep" aria-hidden="true">
+                      /
+                    </span>
+                    <span className="period-plan-target">
+                      {formatRubPerKg(planDeliveryAvgRubPerKg)}
+                    </span>
+                  </p>
+                  <p className="honorarium-cell__hint">Факт сейчас · цель (план) на месяц</p>
+                </li>
+                <li className="honorarium-cell honorarium-cell--bonus" aria-label="Доля логистики: факт и план">
+                  <PeriodGoalEyebrow label="ДОЛЯ ЛОГИСТИКИ" />
+                  <p className="honorarium-cell__amount period-plan-amount-block">
+                    <span
+                      className={[
+                        "period-plan-fact",
+                        deliveryError
+                          ? "period-plan-fact--na"
+                          : logisticsShareVsPlanOk === true
+                            ? "period-plan-fact--ok"
+                            : logisticsShareVsPlanOk === false
+                              ? "period-plan-fact--warn"
+                              : "period-plan-fact--na",
+                      ].join(" ")}
+                      title={
+                        deliveryError
+                          ? deliveryError
+                          : logisticsShareVsPlanOk === true
+                            ? "В норме: факт не выше плана"
+                            : logisticsShareVsPlanOk === false
+                              ? "Выше плана"
+                              : "Недостаточно данных для сравнения"
+                      }
+                    >
+                      {deliveryError ? "—" : formatPercent(logisticsSharePercent)}
+                    </span>
+                    <span className="period-plan-sep" aria-hidden="true">
+                      /
+                    </span>
+                    <span className="period-plan-target">
+                      {formatPercent(planLogisticsSharePercent)}
+                    </span>
+                  </p>
+                  <p className="honorarium-cell__hint">Факт сейчас · цель (план) на месяц</p>
+                </li>
+                <li className="honorarium-cell honorarium-cell--bonus" aria-label="Задачи: план по бонусу">
+                  <PeriodGoalEyebrow label="ЗАДАЧИ" />
+                  <p
+                    className="honorarium-cell__amount period-plan-amount-block period-plan-amount--tasks"
+                    title={`Максимум по плану: ${formatRub(tasksBonusRubFromPlan)}; автооценка задач не считается`}
+                  >
+                    <span className="period-plan-target">
+                      {tasksBonusPercentLabel}% из 10%
+                    </span>
+                  </p>
+                  <p className="honorarium-cell__hint">Порог бонуса из раздела «План»</p>
+                </li>
+              </ul>
+            </div>
+          </div>
+          <div className="filter-bar-plan-column">
+          <section className="honorarium-board" aria-label="Оклад, бонусы и итого">
+            <header className="honorarium-board__intro">
+              <div className="honorarium-board__intro-text">
+                <h3 className="honorarium-board__title">Вознаграждение</h3>
+              </div>
+            </header>
+
+            <div className="honorarium-matrix" role="list">
+              <article
+                className="honorarium-cell honorarium-cell--salary"
+                aria-label="Оклад"
+                role="listitem"
+              >
+                <span className="honorarium-cell__eyebrow">База</span>
+                <p className="honorarium-cell__amount">{formatRub(MONTHLY_SALARY_RUB)}</p>
+                <p className="honorarium-cell__hint">Фиксированно за период</p>
+              </article>
+
+              <article
+                className="honorarium-cell honorarium-cell--bonus honorarium-cell--tone-emerald"
+                aria-label="Бонус за долю себестоимости к отгрузкам"
+                role="listitem"
+              >
+                <HonorariumBonusEyebrow label='Бонус "СЕБЕСТОИМОСТЬ"' />
+                <p className="honorarium-cell__amount">{formatRub(costRatioBonusRub)}</p>
+                <p className="honorarium-cell__hint">
+                  (План − Факт) / 100 × сумма отгрузок × 0,2
+                </p>
+              </article>
+
+              <article
+                className="honorarium-cell honorarium-cell--bonus honorarium-cell--tone-violet"
+                aria-label="Бонус за доставку и долю логистики"
+                role="listitem"
+              >
+                <HonorariumBonusEyebrow label='Бонус "ЛОГИСТИКА"' />
+                <p className="honorarium-cell__amount">{formatRub(deliveryLogisticsBonusRub)}</p>
+                <p className="honorarium-cell__hint">
+                  {`1 из 2 — ${formatRub(DELIVERY_LOGISTICS_BONUS_ONE_RUB)} · оба — ${formatRub(DELIVERY_LOGISTICS_BONUS_BOTH_RUB)} при факт ≤ план`}
+                </p>
+              </article>
+
+              <article
+                className="honorarium-cell honorarium-cell--bonus honorarium-cell--tone-sky"
+                aria-label="Бонус за задачи и поручения"
+                role="listitem"
+              >
+                <HonorariumBonusEyebrow label='Бонус "ЗАДАЧИ"' />
+                <p className="honorarium-cell__amount">{formatRub(tasksBonusRubFromPlan)}</p>
+                <p className="honorarium-cell__hint">
+                  {tasksBonusPercentLabel}% из 10% (макс. 5&nbsp;000 ₽) · план {planMonthIso}
+                </p>
+              </article>
+            </div>
+
+            <article className="honorarium-foot" aria-label="Итого: оклад и все бонусы">
+              <div className="honorarium-foot__total">
+                <span className="honorarium-foot__total-label">Итого</span>
+                <p className="honorarium-foot__total-sum">{formatRub(compensationTotalRub)}</p>
+                <p className="honorarium-foot__total-note">Сумма строк слева</p>
+              </div>
+            </article>
+          </section>
             </div>
         </div>
       </section>
@@ -651,12 +1774,22 @@ export default function App() {
 
       {kpi !== null && (
         <section className="panel sales-hero-panel">
-          <h2 className="sales-hero-heading">Продажи (отгрузки)</h2>
+          <h2 className="sales-hero-heading">Продажи - себестоимость - закупки</h2>
           <div className="sales-hero-row">
             <div className="sales-hero-kpi-slot">
-              <div className="kpi-card kpi-card-compact sales-hero-kpi">
-                <p className="value">{formatRub(kpi.shipments_sum)}</p>
-                <p className="label">Итого за период</p>
+              <div className="sales-hero-kpi-stack">
+                <div className="kpi-card kpi-card-compact sales-hero-kpi-tile sales-hero-kpi-tile--ship">
+                  <p className="value">{formatRub(kpi.shipments_sum)}</p>
+                  <p className="label">Отгрузки, итого</p>
+                </div>
+                <div className="kpi-card kpi-card-compact sales-hero-kpi-tile sales-hero-kpi-tile--cost">
+                  <p className="value">{formatRub(kpi.cost_shipped_sum)}</p>
+                  <p className="label">Себестоимость отгрузок</p>
+                </div>
+                <div className="kpi-card kpi-card-compact sales-hero-kpi-tile sales-hero-kpi-tile--purch">
+                  <p className="value">{formatRub(kpi.purchases_sum)}</p>
+                  <p className="label">Закупки, итого</p>
+                </div>
               </div>
             </div>
             <div className="sales-hero-chart-wrap chart-surface">
@@ -666,28 +1799,48 @@ export default function App() {
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart
                   data={chartDataDaily}
-                  margin={{ top: 14, right: 20, left: 4, bottom: 8 }}
+                  margin={{ top: 36, right: 16, left: 2, bottom: 6 }}
                 >
-                  <CartesianGrid strokeDasharray="3 4" stroke="#e2e8f0" vertical={false} />
+                  <CartesianGrid
+                    strokeDasharray="3 4"
+                    stroke="var(--chart-grid)"
+                    vertical={false}
+                  />
                   <XAxis
                     dataKey="label"
                     interval="preserveStartEnd"
                     minTickGap={10}
-                    tick={{ fontSize: 11, fill: "#64748b" }}
-                    axisLine={{ stroke: "#e2e8f0" }}
+                    tick={{ fontSize: 11, fill: "var(--chart-axis)" }}
+                    axisLine={{ stroke: "var(--chart-axis-line)" }}
                     tickLine={false}
                   />
                   <YAxis
-                    domain={shipmentsYAxisDomain}
-                    tick={{ fontSize: 11, fill: "#64748b" }}
+                    domain={salesMixYAxisDomain}
+                    tick={{ fontSize: 11, fill: "var(--chart-axis)" }}
                     axisLine={false}
                     tickLine={false}
                     width={52}
                     tickCount={6}
                     tickFormatter={(v) => formatAxisCompact(v as number)}
                   />
+                  <Legend
+                    verticalAlign="top"
+                    align="center"
+                    iconType="plainline"
+                    iconSize={14}
+                    wrapperStyle={{
+                      fontSize: "11px",
+                      fontWeight: 600,
+                      color: "var(--chart-axis)",
+                      paddingTop: "2px",
+                      paddingBottom: "2px",
+                    }}
+                  />
                   <Tooltip
-                    formatter={(value: number) => formatRub(value)}
+                    formatter={(value: number | string, name: string) => [
+                      formatRub(typeof value === "number" ? value : Number(value)),
+                      name,
+                    ]}
                     labelFormatter={(_label, items) => {
                       const raw = items?.[0]?.payload?.date;
                       return raw
@@ -703,20 +1856,44 @@ export default function App() {
                     }}
                     contentStyle={{
                       borderRadius: 12,
-                      border: "1px solid #e2e8f0",
-                      boxShadow: "0 12px 36px rgba(15,23,42,0.1)",
+                      border: "var(--chart-tooltip-border)",
+                      background: "var(--chart-tooltip-bg)",
+                      color: "var(--chart-tooltip-color)",
+                      boxShadow: "var(--chart-tooltip-shadow)",
                       fontSize: 12,
                     }}
+                    labelStyle={{ color: "var(--chart-tooltip-label)" }}
+                    itemStyle={{ color: "var(--chart-tooltip-item)" }}
                   />
                   <Line
                     type="monotone"
                     dataKey="shipments"
-                    name="Продажи"
-                    stroke="#1d4ed8"
+                    name="Отгрузки"
+                    stroke="#34d399"
                     strokeWidth={2.5}
                     strokeLinecap="round"
                     dot={{ r: 0 }}
-                    activeDot={{ r: 6, strokeWidth: 0, fill: "#1d4ed8" }}
+                    activeDot={{ r: 5, strokeWidth: 0, fill: "#5eead4" }}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="cost_shipped"
+                    name="Себестоимость"
+                    stroke="#fb923c"
+                    strokeWidth={2}
+                    strokeLinecap="round"
+                    dot={{ r: 0 }}
+                    activeDot={{ r: 5, strokeWidth: 0, fill: "#fdba74" }}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="purchases"
+                    name="Закупки"
+                    stroke="#a78bfa"
+                    strokeWidth={2}
+                    strokeLinecap="round"
+                    dot={{ r: 0 }}
+                    activeDot={{ r: 5, strokeWidth: 0, fill: "#c4b5fd" }}
                   />
                 </LineChart>
               </ResponsiveContainer>
@@ -724,12 +1901,6 @@ export default function App() {
             </div>
           </div>
         </section>
-      )}
-
-      {syncDetail && (
-        <div className="banner" role="alert">
-          {syncDetail}
-        </div>
       )}
 
       {kpi?.sync_error && (
@@ -745,220 +1916,319 @@ export default function App() {
       ) : (
         <>
           <div className="main-dashboard-grid">
+            <div className="main-dashboard-primary-col">
             <section className="panel finance-panel hero-panel">
-              <div className="finance-kpis">
-                <div className="kpi-card kpi-card-compact">
-                  <p className="value">{formatRub(kpi?.cost_shipped_sum ?? null)}</p>
-                  <p className="label">Себестоимость отгрузок</p>
+              <header className="finance-block-head">
+                <div>
+                  <h2 className="finance-block-title">Себестоимость</h2>
                 </div>
-                <div className="kpi-card kpi-card-compact">
-                  <p className="value">{formatRub(kpi?.purchases_sum ?? null)}</p>
-                  <p className="label">Закупки (итого)</p>
+              </header>
+
+              <div className="finance-pfb" aria-label="План, факт и бонус">
+                <div className="finance-pfb-grid">
+                  <article
+                    className="finance-pfb-duo"
+                    aria-label="Факт и план: доля себестоимости к отгрузкам"
+                  >
+                    <div className="finance-pfb-duo-inner">
+                      <div
+                        className={[
+                          "finance-pfb-half finance-pfb-half--fact",
+                          costRatioVsPlanOk === true
+                            ? "finance-pfb-half--fact-ok"
+                            : costRatioVsPlanOk === false
+                              ? "finance-pfb-half--fact-warn"
+                              : "finance-pfb-half--fact-na",
+                        ].join(" ")}
+                      >
+                        <span className="finance-pfb-badge">Факт</span>
+                        <p className="finance-pfb-role-label">Выполнение за период</p>
+                        <p className="finance-pfb-value">{formatPercent(costRatioFactPercent)}</p>
+                        <p className="finance-pfb-caption">
+                          Себестоимость отгрузок / сумма отгрузок × 100%
+                        </p>
+                      </div>
+                      <div className="finance-pfb-duo-divider" aria-hidden="true" />
+                      <div className="finance-pfb-half finance-pfb-half--plan">
+                        <span className="finance-pfb-badge">План</span>
+                        <p className="finance-pfb-role-label">Целевой показатель</p>
+                        <p className="finance-pfb-value">{formatPercent(planPercent)}</p>
+                        <p className="finance-pfb-caption">
+                          Целевая доля с/с к отгрузкам (месяц по дате «От»)
+                        </p>
+                      </div>
+                    </div>
+                  </article>
+                  <article className="finance-pfb-tile finance-pfb-tile--bonus finance-pfb-tile--bonus-star">
+                    <BonusPanelHeader subtitle="За выполнение плана по доле себестоимости к отгрузкам" />
+                    <p className="finance-pfb-value finance-pfb-value--rub">
+                      {formatRub(costRatioBonusRub)}
+                    </p>
+                  </article>
                 </div>
               </div>
-              <h2>Показатели по календарным дням</h2>
-              {chartDataDaily.length === 0 ? (
-                <p className="empty-hint">Укажите период «от — до».</p>
-              ) : (
-                <>
-                  {!hasDailyActivity && kpi?.message === "no_snapshot" && (
-                    <p className="empty-hint chart-hint">
-                      Пока нет данных по дням — выполните «Обновить из Google Sheets».
-                    </p>
-                  )}
-                  <div className="chart-h chart-h-lines chart-h-lines--compact chart-surface">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <AreaChart
-                        data={chartDataDaily}
-                        margin={{ top: 16, right: 20, left: 8, bottom: 12 }}
-                      >
-                        <defs>
-                          <linearGradient id={`${chartGradKey}-cost`} x1="0" y1="0" x2="0" y2="1">
-                            <stop offset="0%" stopColor="#0f2744" stopOpacity={0.45} />
-                            <stop offset="45%" stopColor="#1e40af" stopOpacity={0.15} />
-                            <stop offset="100%" stopColor="#f97316" stopOpacity={0.04} />
-                          </linearGradient>
-                          <linearGradient id={`${chartGradKey}-pur`} x1="0" y1="0" x2="0" y2="1">
-                            <stop offset="0%" stopColor="#f97316" stopOpacity={0.42} />
-                            <stop offset="100%" stopColor="#f97316" stopOpacity={0} />
-                          </linearGradient>
-                        </defs>
-                        <CartesianGrid strokeDasharray="3 4" stroke="#e2e8f0" vertical={false} />
-                        <XAxis
-                          dataKey="label"
-                          interval="preserveStartEnd"
-                          minTickGap={18}
-                          tick={{ fontSize: 11, fill: "#64748b" }}
-                          axisLine={{ stroke: "#e2e8f0" }}
-                          tickLine={false}
-                        />
-                        <YAxis
-                          domain={[0, 300000]}
-                          tick={{ fontSize: 11, fill: "#64748b" }}
-                          axisLine={false}
-                          tickLine={false}
-                          tickCount={6}
-                          tickFormatter={(v) =>
-                            new Intl.NumberFormat("ru-RU", {
-                              maximumFractionDigits: 0,
-                            }).format(v as number)
-                          }
-                          width={48}
-                        />
-                        <Tooltip
-                          formatter={(value: number) => formatRub(value)}
-                          labelFormatter={(_label, items) => {
-                            const raw = items?.[0]?.payload?.date;
-                            return raw
-                              ? new Date(String(raw) + "T12:00:00").toLocaleDateString(
-                                  "ru-RU",
-                                  {
-                                    weekday: "short",
-                                    day: "numeric",
-                                    month: "short",
-                                  },
-                                )
-                              : "";
-                          }}
-                          contentStyle={{
-                            borderRadius: 12,
-                            border: "1px solid #e2e8f0",
-                            boxShadow: "0 16px 48px rgba(15,23,42,0.12)",
-                            fontSize: 12,
-                          }}
-                        />
-                        <Legend
-                          wrapperStyle={{ fontSize: 13, paddingTop: 12 }}
-                          iconType="plainline"
-                          iconSize={18}
-                        />
-                        <Area
-                          type="monotone"
-                          dataKey="cost_shipped"
-                          name="Себестоимость"
-                          stroke="#0f2744"
-                          strokeWidth={2.5}
-                          fill={`url(#${chartGradKey}-cost)`}
-                          fillOpacity={1}
-                          dot={false}
-                          activeDot={{ r: 5, strokeWidth: 0, fill: "#0f2744" }}
-                        />
-                        <Area
-                          type="monotone"
-                          dataKey="purchases"
-                          name="Закупки"
-                          stroke="#ea580c"
-                          strokeWidth={2.5}
-                          fill={`url(#${chartGradKey}-pur)`}
-                          fillOpacity={1}
-                          dot={false}
-                          activeDot={{ r: 5, strokeWidth: 0, fill: "#ea580c" }}
-                        />
-                      </AreaChart>
-                    </ResponsiveContainer>
-                  </div>
-                </>
-              )}
             </section>
 
-          <section className="panel procurement-panel">
-            <div className="kpi-grid procurement-grid">
-              <div className="kpi-card kpi-card-list kpi-card-wide reorder-card">
-                <div className="reorder-card-title-row">
-                  <p className="list-title">Заказать сырьё</p>
-                  <a
-                    className="reorder-sheet-link"
-                    href="https://docs.google.com/spreadsheets/d/1eUdgokEoZ72xePF8RmQZbuWwoYNuJH9rvU3WvUxBTEE/edit?gid=1246024051#gid=1246024051"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    Таблица ↗
-                  </a>
+            <section
+              className="delivery-cost-strip panel logistics-block logistics-block--framed"
+              aria-label="Логистика: доставка, доля логистики и закупки"
+            >
+              <header className="logistics-block-head">
+                <div className="logistics-block-head-accent" aria-hidden="true" />
+                <div className="logistics-block-head-inner">
+                  <h2 className="logistics-block-title">Логистика</h2>
                 </div>
-                <p className="reorder-sheet-hint">
-                  Если на листе в Google включён фильтр (иконка в шапке столбца), в
-                  дашборд попадают только видимые строки — для полного списка снимите
-                  фильтр в таблице.
-                </p>
-                {reorderCategoryLabels.length > 0 ? (
-                  <div
-                    className="reorder-category-toolbar"
-                    role="group"
-                    aria-label="Фильтр по группе из столбца «Группа»"
+              </header>
+              <div className="logistics-with-procurement">
+                {deliveryError ? (
+                  <p
+                    className="delivery-cost-error delivery-cost-error--span logistics-procurement-error"
+                    role="alert"
                   >
-                    <div className="reorder-category-filters">
-                      {reorderCategoryLabels.map((label) => {
-                        const key = normalizeReorderGroupKey(label);
-                        const active = reorderCategoryFilter.includes(key);
-                        return (
-                          <button
-                            type="button"
-                            key={key}
-                            className={`reorder-category-btn${active ? " reorder-category-btn--active" : ""}`}
-                            aria-pressed={active}
-                            title={label}
-                            onClick={() => {
-                              toggleReorderCategory(label);
-                            }}
-                          >
-                            {shortenReorderCategoryButtonLabel(label)}
-                          </button>
-                        );
-                      })}
-                    </div>
-                    {reorderCategoryFilter.length > 0 ? (
-                      <button
-                        type="button"
-                        className="reorder-category-clear"
-                        onClick={clearReorderCategoryFilter}
+                    {deliveryError}
+                  </p>
+              ) : (
+                <>
+                    <div className="logistics-left-column">
+                    <div className="logistics-band logistics-band--fact">
+                      <div className="logistics-band-cards">
+                        <article className="delivery-cost-card delivery-cost-card--metric delivery-cost-card--nested delivery-cost-card--delivery delivery-cost-card--fact-plan">
+                          <div className="logistics-mini-card-head">
+                            <h4 className="logistics-mini-card-title">Средняя стоимость доставки</h4>
+                            <a
+                              className="logistics-mini-card-sheet-link"
+                              href={DELIVERY_LOGISTICS_SOURCE_SHEET_URL}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                            >
+                              Таблица ↗
+                            </a>
+                          </div>
+                          <div className="logistics-fact-plan-split">
+                            <div
+                              className={logisticsFactPlanFactColClass(
+                                logisticsFactNotWorseThanPlan(
+                                  deliveryAvgRubPerKg,
+                                  planDeliveryAvgRubPerKg,
+                                ),
+                                { noData: Boolean(deliveryError) },
+                              )}
+                              title={
+                                deliveryError
+                                  ? deliveryError
+                                  : deliveryAvgVsPlanOk === true
+                                    ? "Факт не выше плана"
+                                    : deliveryAvgVsPlanOk === false
+                                      ? "Факт выше плана"
+                                      : "Недостаточно данных для сравнения"
+                              }
+                            >
+                              <span className="logistics-fact-plan-tag">Факт</span>
+                              <p className="logistics-fact-plan-role">Среднее по записям I</p>
+                              <p className="delivery-cost-value logistics-fact-plan-value logistics-fact-plan-value--in-cell">
+                                {deliveryError ? "—" : formatRubPerKg(deliveryAvgRubPerKg)}
+                              </p>
+                            </div>
+                            <div className="logistics-fact-plan-col logistics-fact-plan-col--plan">
+                              <span className="logistics-fact-plan-tag logistics-fact-plan-tag--plan">
+                                План
+                              </span>
+                              <p className="logistics-fact-plan-role logistics-fact-plan-role--plan">
+                                Целевой показатель
+                              </p>
+                              <p className="delivery-cost-value delivery-cost-value--plan-compact logistics-fact-plan-value--in-cell">
+                                {formatRubPerKg(planDeliveryAvgRubPerKg)}
+                              </p>
+                            </div>
+                          </div>
+                          <p className="delivery-cost-meta">
+                            {deliveryRowsUsed > 0
+                              ? `Среднее за период · ${deliveryRowsUsed} записей (заполненный I ≥ 0)`
+                              : deliveryRowsInPeriod > 0
+                                ? "Нет заполненных значений I ≥ 0 за период"
+                                : "Нет строк с датой в F в выбранном периоде"}
+                          </p>
+                        </article>
+                        <article className="delivery-cost-card delivery-cost-card--metric delivery-cost-card--nested delivery-cost-card--share delivery-cost-card--fact-plan">
+                          <div className="logistics-mini-card-head">
+                            <h4 className="logistics-mini-card-title">Доля логистики</h4>
+                            <a
+                              className="logistics-mini-card-sheet-link"
+                              href={DELIVERY_LOGISTICS_SOURCE_SHEET_URL}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                            >
+                              Таблица ↗
+                            </a>
+                          </div>
+                          <div className="logistics-fact-plan-split">
+                            <div
+                              className={logisticsFactPlanFactColClass(
+                                logisticsFactNotWorseThanPlan(
+                                  logisticsSharePercent,
+                                  planLogisticsSharePercent,
+                                ),
+                                { noData: Boolean(deliveryError) },
+                              )}
+                              title={
+                                deliveryError
+                                  ? deliveryError
+                                  : logisticsShareVsPlanOk === true
+                                    ? "Факт не выше плана"
+                                    : logisticsShareVsPlanOk === false
+                                      ? "Факт выше плана"
+                                      : "Недостаточно данных для сравнения"
+                              }
+                            >
+                              <span className="logistics-fact-plan-tag">Факт</span>
+                              <p className="logistics-fact-plan-role">Доля к отгрузкам за период</p>
+                              <p className="delivery-cost-value delivery-cost-value--percent logistics-fact-plan-value logistics-fact-plan-value--in-cell">
+                                {deliveryError ? "—" : formatPercent(logisticsSharePercent)}
+                              </p>
+                            </div>
+                            <div className="logistics-fact-plan-col logistics-fact-plan-col--plan">
+                              <span className="logistics-fact-plan-tag logistics-fact-plan-tag--plan">
+                                План
+                              </span>
+                              <p className="logistics-fact-plan-role logistics-fact-plan-role--plan">
+                                Целевой показатель
+                              </p>
+                              <p className="delivery-cost-value delivery-cost-value--percent delivery-cost-value--plan-compact logistics-fact-plan-value--in-cell">
+                                {formatPercent(planLogisticsSharePercent)}
+                              </p>
+                            </div>
+                          </div>
+                          <p className="delivery-cost-meta">
+                            {deliveryHValuesCount > 0
+                              ? logisticsSharePercent != null
+                                ? `Ненулевых в H: ${deliveryHValuesCount}`
+                                : "Сумма по E = 0 — проверьте E"
+                              : "В H нет ненулевых за период"}
+                          </p>
+                        </article>
+                      </div>
+                      <article
+                        className="finance-pfb-tile finance-pfb-tile--bonus finance-pfb-tile--bonus-star logistics-bonus-as-finance-tile"
+                        aria-label="Бонус логистики за период"
                       >
-                        Сбросить фильтр
-                      </button>
-                    ) : null}
-                  </div>
-                ) : null}
-                <div className="reorder-list-panel">
-                  <div className="kpi-list-head">
-                    <span>Наименование</span>
-                    <span>Хватит на</span>
-                  </div>
-                  {displayedReorderItems.length > 0 ? (
-                    <ul className="kpi-list">
-                      {displayedReorderItems.map((it) => (
-                        <li key={`${(it.group || "").trim()}\t${it.name}`}>
-                          <span>{it.name}</span>
-                          <strong>
-                            {it.stock.toLocaleString("ru-RU")} {dayWord(it.stock)}
-                          </strong>
-                        </li>
-                      ))}
-                    </ul>
-                  ) : reorderItems.length > 0 ? (
-                    <p className="sub">Нет позиций в выбранных категориях.</p>
-                  ) : (
-                    <p className="sub">Нет позиций для заказа.</p>
-                  )}
-                </div>
+                        <BonusPanelHeader subtitle="За выполнение плана по доставке и доле логистики" />
+                        <p className="finance-pfb-value finance-pfb-value--rub">
+                          {formatRub(deliveryLogisticsBonusRub)}
+                        </p>
+                        <p className="finance-pfb-caption logistics-bonus-footnote">
+                          1 из 2 по плану — {formatRub(DELIVERY_LOGISTICS_BONUS_ONE_RUB)}
+                          <br />
+                          оба — {formatRub(DELIVERY_LOGISTICS_BONUS_BOTH_RUB)} (факт ≤ план)
+                        </p>
+                      </article>
+                    </div>
+                    </div>
+
+                    <aside
+                      className="logistics-reorder-aside"
+                      aria-label="Заказать сырьё"
+                    >
+                      <div className="kpi-card kpi-card-list reorder-card logistics-reorder-card">
+                        <div className="reorder-card-title-row">
+                          <p className="list-title">Заказать сырьё</p>
+                          <a
+                            className="reorder-sheet-link"
+                            href="https://docs.google.com/spreadsheets/d/1eUdgokEoZ72xePF8RmQZbuWwoYNuJH9rvU3WvUxBTEE/edit?gid=1246024051#gid=1246024051"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                          >
+                            Таблица ↗
+                          </a>
+                        </div>
+                        {reorderCategoryLabels.length > 0 ? (
+                          <div
+                            className="reorder-category-toolbar"
+                            role="group"
+                            aria-label="Фильтр по группе из столбца «Группа»"
+                          >
+                            <div className="reorder-category-filters">
+                              {reorderCategoryLabels.map((label) => {
+                                const key = normalizeReorderGroupKey(label);
+                                const active = reorderCategoryFilter.includes(key);
+                                return (
+                                  <button
+                                    type="button"
+                                    key={key}
+                                    className={`reorder-category-btn${active ? " reorder-category-btn--active" : ""}`}
+                                    aria-pressed={active}
+                                    title={label}
+                                    onClick={() => {
+                                      toggleReorderCategory(label);
+                                    }}
+                                  >
+                                    {shortenReorderCategoryButtonLabel(label)}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                            {reorderCategoryFilter.length > 0 ? (
+                              <button
+                                type="button"
+                                className="reorder-category-clear"
+                                onClick={clearReorderCategoryFilter}
+                              >
+                                Сбросить фильтр
+                              </button>
+                            ) : null}
+                          </div>
+                        ) : null}
+                        <div className="reorder-list-panel">
+                          <div className="kpi-list-head">
+                            <span>Наименование</span>
+                            <span>Хватит на</span>
+                          </div>
+                          {displayedReorderItems.length > 0 ? (
+                            <ul className="kpi-list">
+                              {displayedReorderItems.map((it) => (
+                                <li key={`${(it.group || "").trim()}\t${it.name}`}>
+                                  <span>{it.name}</span>
+                                  <strong>
+                                    {it.stock.toLocaleString("ru-RU", {
+                                      minimumFractionDigits: 0,
+                                      maximumFractionDigits: 1,
+                                    })}{" "}
+                                    {dayWord(it.stock)}
+                                  </strong>
+                                </li>
+                              ))}
+                            </ul>
+                          ) : reorderItems.length > 0 ? (
+                            <p className="sub">Нет позиций в выбранных категориях.</p>
+                          ) : (
+                            <p className="sub">Нет позиций для заказа.</p>
+                          )}
+                        </div>
+                      </div>
+                    </aside>
+                </>
+              )}
               </div>
+            </section>
             </div>
-          </section>
           </div>
 
           <section className="panel raw-materials-panel">
             <h2 className="raw-materials-panel-title">Сырьё на складе и в пути</h2>
             <div className="raw-stock-line">
-              <div className="kpi-card kpi-card-compact raw-stock-tile">
-                <p className="value">{formatRub(kpi?.raw_material_stock_sum ?? null)}</p>
-                <p className="label">Остаток сырья на складе</p>
-              </div>
-              <div className="kpi-card kpi-card-compact raw-stock-tile">
-                <p className="value">{formatRub(rawMaterialInTransitRub)}</p>
-                <p className="label">Сырьё в пути</p>
-                {rawMaterialInTransitError ? (
-                  <p className="raw-stock-tile-error" role="alert">
-                    {rawMaterialInTransitError}
-                  </p>
-                ) : null}
+              <div className="raw-stock-kpis-column">
+                <div className="kpi-card kpi-card-compact raw-stock-tile">
+                  <p className="value">{formatRub(kpi?.raw_material_stock_sum ?? null)}</p>
+                  <p className="label">Остаток сырья на складе</p>
+                </div>
+                <div className="kpi-card kpi-card-compact raw-stock-tile">
+                  <p className="value">{formatRub(rawMaterialInTransitRub)}</p>
+                  <p className="label">Сырьё в пути</p>
+                  {rawMaterialInTransitError ? (
+                    <p className="raw-stock-tile-error" role="alert">
+                      {rawMaterialInTransitError}
+                    </p>
+                  ) : null}
+                </div>
               </div>
               <div className="raw-stock-mini panel">
                 <h3 className="raw-stock-chart-title">Остаток сырья по дням</h3>
@@ -977,19 +2247,23 @@ export default function App() {
                           data={chartDataDaily}
                           margin={{ top: 12, right: 16, left: 20, bottom: 14 }}
                         >
-                          <CartesianGrid strokeDasharray="3 4" stroke="#dbe5f1" vertical={false} />
+                          <CartesianGrid
+                            strokeDasharray="3 4"
+                            stroke="var(--chart-grid)"
+                            vertical={false}
+                          />
                           <XAxis
                             dataKey="label"
                             interval="preserveStartEnd"
                             minTickGap={22}
-                            tick={{ fontSize: 11, fill: "#64748b" }}
-                            axisLine={{ stroke: "#cbd5e1" }}
+                            tick={{ fontSize: 11, fill: "var(--chart-axis)" }}
+                            axisLine={{ stroke: "var(--chart-axis-line)" }}
                             tickLine={false}
                             tickMargin={8}
                           />
                           <YAxis
                             domain={rawMaterialYAxisDomain}
-                            tick={{ fontSize: 11, fill: "#64748b" }}
+                            tick={{ fontSize: 11, fill: "var(--chart-axis)" }}
                             axisLine={false}
                             tickLine={false}
                             tickFormatter={(v) => formatMillionTick(v as number)}
@@ -1013,21 +2287,25 @@ export default function App() {
                             }}
                             contentStyle={{
                               borderRadius: 12,
-                              border: "1px solid #e2e8f0",
-                              boxShadow: "0 10px 40px rgba(15,23,42,0.08)",
+                              border: "var(--chart-tooltip-border)",
+                              background: "var(--chart-tooltip-bg)",
+                              color: "var(--chart-tooltip-color)",
+                              boxShadow: "var(--chart-tooltip-shadow)",
                               fontSize: 12,
                             }}
+                            labelStyle={{ color: "var(--chart-tooltip-label)" }}
+                            itemStyle={{ color: "var(--chart-tooltip-item)" }}
                           />
                           <Line
                             type="monotone"
                             dataKey="raw_material_stock"
                             name="Остаток сырья"
-                            stroke="#16a34a"
+                            stroke="#4ade80"
                             strokeWidth={3}
                             strokeLinecap="round"
                             strokeLinejoin="round"
-                            dot={{ r: 2, strokeWidth: 0, fill: "#16a34a" }}
-                            activeDot={{ r: 6, strokeWidth: 0, fill: "#16a34a" }}
+                            dot={{ r: 2, strokeWidth: 0, fill: "#4ade80" }}
+                            activeDot={{ r: 6, strokeWidth: 0, fill: "#86efac" }}
                           />
                         </LineChart>
                       </ResponsiveContainer>

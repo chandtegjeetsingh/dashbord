@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -37,6 +38,26 @@ def _api_key() -> str:
     return key
 
 
+def _http_timeout_sec() -> float:
+    """Таймаут одного HTTP-запроса (сек). Раньше было 15 — при медленном TLS к YouGile часто handshake timeout."""
+    raw = os.getenv("YOUGILE_HTTP_TIMEOUT", "45").strip()
+    try:
+        v = float(raw.replace(",", "."))
+    except ValueError:
+        return 45.0
+    return max(5.0, min(v, 120.0))
+
+
+def _http_retries() -> int:
+    """Сколько повторить запрос после сетевой ошибки (0 = одна попытка)."""
+    raw = os.getenv("YOUGILE_HTTP_RETRIES", "2").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        return 2
+    return max(0, min(n, 8))
+
+
 def _request_json(path: str, params: dict[str, Any] | None = None) -> Any:
     qs = f"?{parse.urlencode(params)}" if params else ""
     req = request.Request(
@@ -47,15 +68,20 @@ def _request_json(path: str, params: dict[str, Any] | None = None) -> Any:
         },
         method="GET",
     )
-    try:
-        with request.urlopen(req, timeout=15) as r:
-            body = r.read().decode("utf-8", errors="replace")
-            return json.loads(body) if body else {}
-    except error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"YouGile HTTP {e.code}: {body[:300]}") from e
-    except error.URLError as e:
-        raise RuntimeError(f"Ошибка сети YouGile: {e.reason}") from e
+    timeout = _http_timeout_sec()
+    attempts = 1 + _http_retries()
+    for attempt in range(attempts):
+        try:
+            with request.urlopen(req, timeout=timeout) as r:
+                body = r.read().decode("utf-8", errors="replace")
+                return json.loads(body) if body else {}
+        except error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"YouGile HTTP {e.code}: {body[:300]}") from e
+        except error.URLError as e:
+            if attempt + 1 >= attempts:
+                raise RuntimeError(f"Ошибка сети YouGile: {e.reason}") from e
+            time.sleep(0.75 * (attempt + 1))
 
 
 @dataclass

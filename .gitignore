@@ -2,6 +2,7 @@
 .env.save
 .env.*
 !.env.example
+!frontend/.env.example
 service-account.json
 *.json.key
 .venv
