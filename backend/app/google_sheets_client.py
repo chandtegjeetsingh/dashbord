@@ -46,13 +46,18 @@ def _parse_sheet_date(value: str) -> date | None:
         except ValueError:
             return None
 
-    # Быстрый парс dd.mm.yyyy (и игнорируем время после пробела).
-    m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})", s)
+    # Быстрый парс dd.mm.yyyy / dd.mm.yy (и игнорируем время после пробела).
+    m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{2,4})", s)
     if m:
         d = int(m.group(1))
         mo = int(m.group(2))
         y = int(m.group(3))
-        return date(y, mo, d)
+        if y < 100:
+            y += 2000
+        try:
+            return date(y, mo, d)
+        except ValueError:
+            return None
 
     # ISO date prefix.
     try:

@@ -16,13 +16,14 @@ type MonthlyPlanResponse = {
   cost_ratio_plan_percent: number | null;
   delivery_avg_rub_per_kg: number | null;
   logistics_share_plan_percent: number | null;
+  shipping_avg_plan_days: number | null;
   tasks_bonus_percent: number | null;
 };
 
 /** Оклад и максимум бонуса за задачи (10 % → 5 000 ₽) — константы ТЗ. */
 const MONTHLY_SALARY_RUB = 50_000;
 const TASKS_BONUS_MAX_RUB = 5_000;
-/** Доставка + доля логистики: 1 из 2 по плану — 4 000 ₽; оба — 12 000 ₽ (факт ≤ план). */
+/** Бонус логистики: 1 из 2 показателей выполнен — 4 000 ₽; оба — 12 000 ₽ (факт ≤ план). */
 const DELIVERY_LOGISTICS_BONUS_ONE_RUB = 4_000;
 const DELIVERY_LOGISTICS_BONUS_BOTH_RUB = 12_000;
 
@@ -73,6 +74,10 @@ const DELIVERY_LOGISTICS_SOURCE_SHEET_URL =
   import.meta.env.VITE_DELIVERY_LOGISTICS_SHEET_URL?.trim() ||
   "https://docs.google.com/spreadsheets/d/1cNLC0WZVIcHJWQbKYbpbedAdxANDze3VV12Op2F1O3E/edit";
 
+const MOYSKLAD_CUSTOMER_ORDERS_URL =
+  import.meta.env.VITE_MOYSKLAD_CUSTOMER_ORDERS_URL?.trim() ||
+  "https://online.moysklad.ru/app/#customerorder";
+
 type DeliveryCostPerKgResponse = {
   avg_rub_per_kg: number | null;
   rows_used: number;
@@ -81,8 +86,26 @@ type DeliveryCostPerKgResponse = {
   logistics_share_percent: number | null;
   sum_h_rub: number;
   sum_e_rub: number;
+  sum_g_rub: number;
   period_from: string;
   period_to: string;
+};
+
+type AvgShippingDaysResponse = {
+  avg_days: number | null;
+  orders_shipped: number;
+  orders_in_period: number;
+  orders_pending: number;
+  period_from: string;
+  period_to: string;
+  source?: string;
+  samples?: Array<{
+    name: string;
+    agent: string;
+    created: string;
+    shipped_at: string;
+    days: number;
+  }>;
 };
 
 type KpiPayload = {
@@ -147,6 +170,16 @@ function formatRubPerKg(n: number | null | undefined): string {
     maximumFractionDigits: 1,
   }).format(n);
   return `${s}\u00a0/\u00a0кг`;
+}
+
+function formatDays(n: number | null | undefined): string {
+  if (n == null || Number.isNaN(n)) return "—";
+  const label = Math.abs(n - Math.round(n)) < 0.05 ? Math.round(n) : n;
+  const formatted =
+    typeof label === "number" && !Number.isInteger(label)
+      ? label.toFixed(1).replace(".", ",")
+      : String(label);
+  return `${formatted}\u00a0дн.`;
 }
 
 function formatPercent(n: number | null | undefined, digits = 1): string {
@@ -616,8 +649,8 @@ function MonthlyPlansSavedSummary({
                 <span className="plan-month-row-title">{formatPlanMonthRowHeading(row.month)}</span>
                 <span className="plan-month-row-metrics">
                   С/с {formatPercent(row.cost_ratio_plan_percent)} · Доставка{" "}
-                  {formatRubPerKg(row.delivery_avg_rub_per_kg)} · Логистика{" "}
-                  {formatPercent(row.logistics_share_plan_percent)} · Задачи{" "}
+                  {formatRubPerKg(row.delivery_avg_rub_per_kg)} · Отгрузка{" "}
+                  {formatDays(row.shipping_avg_plan_days)} · Задачи{" "}
                   {formatPercent(row.tasks_bonus_percent)}
                 </span>
               </button>
@@ -737,7 +770,7 @@ function PlanSettingsPage({
   );
   const [pct, setPct] = useState("");
   const [delPlanAvg, setDelPlanAvg] = useState("");
-  const [delPlanShare, setDelPlanShare] = useState("");
+  const [delPlanShipping, setDelPlanShipping] = useState("");
   const [tasksBonusPct, setTasksBonusPct] = useState("0");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -765,9 +798,9 @@ function PlanSettingsPage({
         if (mp.delivery_avg_rub_per_kg != null) {
           setDelPlanAvg(String(mp.delivery_avg_rub_per_kg));
         } else setDelPlanAvg("");
-        if (mp.logistics_share_plan_percent != null) {
-          setDelPlanShare(String(mp.logistics_share_plan_percent));
-        } else setDelPlanShare("");
+        if (mp.shipping_avg_plan_days != null) {
+          setDelPlanShipping(String(mp.shipping_avg_plan_days));
+        } else setDelPlanShipping("");
         if (mp.tasks_bonus_percent != null) setTasksBonusPct(String(mp.tasks_bonus_percent));
         else setTasksBonusPct("0");
         setMsg(null);
@@ -787,9 +820,16 @@ function PlanSettingsPage({
       if (num < 0 || num > 500) throw new Error("План по себестоимости: допустимо 0…500 %");
 
       const avg = parseOptionalPlanNumber(delPlanAvg);
-      const sh = parseOptionalPlanNumber(delPlanShare);
-      if (avg === "bad" || sh === "bad") {
-        throw new Error("Доставка / логистика: введите числа или оставьте поле пустым для сброса");
+      if (avg === "bad") {
+        throw new Error("Доставка: введите число или оставьте поле пустым для сброса");
+      }
+
+      const sh = parseOptionalPlanNumber(delPlanShipping);
+      if (sh === "bad") {
+        throw new Error("Время отгрузки: введите число или оставьте поле пустым для сброса");
+      }
+      if (sh != null && (sh < 0 || sh > 365)) {
+        throw new Error("Время отгрузки: допустимо 0…365 дн.");
       }
 
       const rawTasks = tasksBonusPct.trim() || "0";
@@ -804,7 +844,7 @@ function PlanSettingsPage({
           month: planMonthIso,
           cost_ratio_plan_percent: num,
           delivery_avg_rub_per_kg: avg,
-          logistics_share_plan_percent: sh,
+          shipping_avg_plan_days: sh,
           tasks_bonus_percent: tasksN,
         }),
       });
@@ -876,7 +916,7 @@ function PlanSettingsPage({
               />
             </label>
 
-            <h3 className="plan-page-h3 plan-page-h3--spaced">Доставка и логистика</h3>
+            <h3 className="plan-page-h3 plan-page-h3--spaced">Доставка</h3>
             <label className="plan-page-field">
               <span>План: средняя стоимость доставки, ₽/кг</span>
               <input
@@ -889,14 +929,14 @@ function PlanSettingsPage({
               />
             </label>
             <label className="plan-page-field plan-page-field--tight">
-              <span>План: доля логистики, %</span>
+              <span>План: среднее время отгрузки, дн.</span>
               <input
                 type="number"
-                step="0.01"
+                step="0.1"
                 min={0}
-                max={500}
-                value={delPlanShare}
-                onChange={(e) => setDelPlanShare(e.target.value)}
+                max={365}
+                value={delPlanShipping}
+                onChange={(e) => setDelPlanShipping(e.target.value)}
                 className="plan-page-input"
               />
             </label>
@@ -976,9 +1016,7 @@ export default function App() {
   const [planDeliveryAvgRubPerKg, setPlanDeliveryAvgRubPerKg] = useState<
     number | null
   >(null);
-  const [planLogisticsSharePercent, setPlanLogisticsSharePercent] = useState<
-    number | null
-  >(null);
+  const [planShippingAvgDays, setPlanShippingAvgDays] = useState<number | null>(null);
   const [dailyDays, setDailyDays] = useState<DailyBreakdownDay[]>([]);
   const [periodMode, setPeriodMode] = useState<PeriodMode>("month");
   const [reorderItems, setReorderItems] = useState<ReorderItem[]>([]);
@@ -993,11 +1031,14 @@ export default function App() {
     string | null
   >(null);
   const [deliveryAvgRubPerKg, setDeliveryAvgRubPerKg] = useState<number | null>(null);
-  const [deliveryRowsUsed, setDeliveryRowsUsed] = useState(0);
   const [deliveryRowsInPeriod, setDeliveryRowsInPeriod] = useState(0);
-  const [deliveryHValuesCount, setDeliveryHValuesCount] = useState(0);
-  const [logisticsSharePercent, setLogisticsSharePercent] = useState<number | null>(null);
   const [deliveryError, setDeliveryError] = useState<string | null>(null);
+  const [shippingAvgDays, setShippingAvgDays] = useState<number | null>(null);
+  const [shippingOrdersShipped, setShippingOrdersShipped] = useState(0);
+  const [shippingOrdersInPeriod, setShippingOrdersInPeriod] = useState(0);
+  const [shippingError, setShippingError] = useState<string | null>(null);
+  const [shippingLoading, setShippingLoading] = useState(false);
+  const [shippingIncludeMarketplaces, setShippingIncludeMarketplaces] = useState(false);
   const [yougileTasks, setYougileTasks] = useState<YougileTask[]>([]);
   const [yougileLoading, setYougileLoading] = useState(false);
   const [yougileError, setYougileError] = useState<string | null>(null);
@@ -1044,12 +1085,43 @@ export default function App() {
     }
   }, []);
 
+  const reloadShippingKpi = useCallback(
+    async (includeMarketplaces: boolean) => {
+      if (!dateFrom || !dateTo) return;
+      const q = periodQuery(dateFrom, dateTo);
+      setShippingLoading(true);
+      setShippingError(null);
+      try {
+        const data = await fetchJson<AvgShippingDaysResponse>(
+          `/api/kpi/avg-shipping-days?${q}&${new URLSearchParams({
+            include_marketplaces: includeMarketplaces ? "true" : "false",
+          }).toString()}`,
+        );
+        setShippingAvgDays(data.avg_days ?? null);
+        setShippingOrdersShipped(data.orders_shipped ?? 0);
+        setShippingOrdersInPeriod(data.orders_in_period ?? 0);
+        setShippingError(null);
+      } catch (e) {
+        setShippingAvgDays(null);
+        setShippingOrdersShipped(0);
+        setShippingOrdersInPeriod(0);
+        setShippingError(
+          e instanceof Error ? e.message : "Не удалось загрузить время отгрузки",
+        );
+      } finally {
+        setShippingLoading(false);
+      }
+    },
+    [dateFrom, dateTo],
+  );
+
   const loadKpiOnly = useCallback(async () => {
     if (!dateFrom || !dateTo) return;
     const requestId = ++latestKpiRequestIdRef.current;
     const q = periodQuery(dateFrom, dateTo);
     setRawMaterialInTransitError(null);
     setDeliveryError(null);
+    setShippingError(null);
     const transitP = fetchJson<{ sum_rub: number }>("/api/kpi/raw-material-in-transit")
       .then((x) => ({ ok: true as const, sum: x.sum_rub }))
       .catch((e) => ({
@@ -1075,7 +1147,22 @@ export default function App() {
             : "Не удалось загрузить стоимость доставки",
       }));
 
-    const [kc, kd, rr, transitRes, monthlyPlanRes, deliveryRes] = await Promise.all([
+    const shippingP = fetchJson<AvgShippingDaysResponse>(
+      `/api/kpi/avg-shipping-days?${q}&${new URLSearchParams({
+        include_marketplaces: shippingIncludeMarketplaces ? "true" : "false",
+      }).toString()}`,
+    )
+      .then((x) => ({ ok: true as const, data: x }))
+      .catch((e) => ({
+        ok: false as const,
+        err:
+          e instanceof Error
+            ? e.message
+            : "Не удалось загрузить время отгрузки",
+      }));
+
+    const [kc, kd, rr, transitRes, monthlyPlanRes, deliveryRes, shippingRes] =
+      await Promise.all([
       fetchJson<KpiPayload>(`/api/kpi/current?${q}`),
       fetchJson<{ days: DailyBreakdownDay[] }>(`/api/kpi/daily-breakdown?${q}`),
       fetchJson<{ items: ReorderItem[]; categories?: string[] }>(
@@ -1084,6 +1171,7 @@ export default function App() {
       transitP,
       monthlyPlanP,
       deliveryP,
+      shippingP,
     ]);
     if (requestId !== latestKpiRequestIdRef.current) return;
     setKpi(kc);
@@ -1107,25 +1195,30 @@ export default function App() {
       const mp = monthlyPlanRes.data;
       setPlanPercent(mp.cost_ratio_plan_percent ?? null);
       setPlanDeliveryAvgRubPerKg(mp.delivery_avg_rub_per_kg ?? null);
-      setPlanLogisticsSharePercent(mp.logistics_share_plan_percent ?? null);
+      setPlanShippingAvgDays(mp.shipping_avg_plan_days ?? null);
       setTasksBonusPlanPercent(mp.tasks_bonus_percent ?? null);
     }
     if (deliveryRes.ok) {
       setDeliveryAvgRubPerKg(deliveryRes.data.avg_rub_per_kg ?? null);
-      setDeliveryRowsUsed(deliveryRes.data.rows_used ?? 0);
       setDeliveryRowsInPeriod(deliveryRes.data.rows_in_period ?? 0);
-      setDeliveryHValuesCount(deliveryRes.data.h_values_count ?? 0);
-      setLogisticsSharePercent(deliveryRes.data.logistics_share_percent ?? null);
       setDeliveryError(null);
     } else {
       setDeliveryAvgRubPerKg(null);
-      setDeliveryRowsUsed(0);
       setDeliveryRowsInPeriod(0);
-      setDeliveryHValuesCount(0);
-      setLogisticsSharePercent(null);
       setDeliveryError(deliveryRes.err);
     }
-  }, [dateFrom, dateTo]);
+    if (shippingRes.ok) {
+      setShippingAvgDays(shippingRes.data.avg_days ?? null);
+      setShippingOrdersShipped(shippingRes.data.orders_shipped ?? 0);
+      setShippingOrdersInPeriod(shippingRes.data.orders_in_period ?? 0);
+      setShippingError(null);
+    } else {
+      setShippingAvgDays(null);
+      setShippingOrdersShipped(0);
+      setShippingOrdersInPeriod(0);
+      setShippingError(shippingRes.err);
+    }
+  }, [dateFrom, dateTo, shippingIncludeMarketplaces]);
 
   useEffect(() => {
     if (!defaultsLoaded) return;
@@ -1321,25 +1414,25 @@ export default function App() {
   const deliveryLogisticsBonusRub = useMemo(() => {
     const pAvg = planDeliveryAvgRubPerKg;
     const fAvg = deliveryAvgRubPerKg;
-    const pSh = planLogisticsSharePercent;
-    const fSh = logisticsSharePercent;
+    const pSh = planShippingAvgDays;
+    const fSh = shippingAvgDays;
     const hasAvg =
       pAvg != null && fAvg != null && Number.isFinite(pAvg) && Number.isFinite(fAvg);
-    const hasShare =
+    const hasShipping =
       pSh != null && fSh != null && Number.isFinite(pSh) && Number.isFinite(fSh);
-    const nApplicable = (hasAvg ? 1 : 0) + (hasShare ? 1 : 0);
+    const nApplicable = (hasAvg ? 1 : 0) + (hasShipping ? 1 : 0);
     if (nApplicable === 0) return null;
     const metAvg = hasAvg && fAvg <= pAvg;
-    const metShare = hasShare && fSh <= pSh;
-    const nMet = (metAvg ? 1 : 0) + (metShare ? 1 : 0);
+    const metShipping = hasShipping && fSh <= pSh;
+    const nMet = (metAvg ? 1 : 0) + (metShipping ? 1 : 0);
     if (nMet === 0) return 0;
     if (nApplicable === 2 && nMet === 2) return DELIVERY_LOGISTICS_BONUS_BOTH_RUB;
     return DELIVERY_LOGISTICS_BONUS_ONE_RUB;
   }, [
     planDeliveryAvgRubPerKg,
-    planLogisticsSharePercent,
+    planShippingAvgDays,
     deliveryAvgRubPerKg,
-    logisticsSharePercent,
+    shippingAvgDays,
   ]);
 
   /** 0…10 % от максимума 5 000 ₽ (линейно). */
@@ -1381,9 +1474,9 @@ export default function App() {
     [deliveryAvgRubPerKg, planDeliveryAvgRubPerKg],
   );
 
-  const logisticsShareVsPlanOk = useMemo(
-    () => logisticsFactNotWorseThanPlan(logisticsSharePercent, planLogisticsSharePercent),
-    [logisticsSharePercent, planLogisticsSharePercent],
+  const shippingAvgVsPlanOk = useMemo(
+    () => logisticsFactNotWorseThanPlan(shippingAvgDays, planShippingAvgDays),
+    [shippingAvgDays, planShippingAvgDays],
   );
 
   const { urgentTasks, overdueTasks } = useMemo(() => {
@@ -1590,37 +1683,37 @@ export default function App() {
                   </p>
                   <p className="honorarium-cell__hint">Факт сейчас · цель (план) на месяц</p>
                 </li>
-                <li className="honorarium-cell honorarium-cell--bonus" aria-label="Доля логистики: факт и план">
-                  <PeriodGoalEyebrow label="ДОЛЯ ЛОГИСТИКИ" />
+                <li className="honorarium-cell honorarium-cell--bonus" aria-label="Среднее время отгрузки: факт и план">
+                  <PeriodGoalEyebrow label="ВРЕМЯ ОТГРУЗКИ" />
                   <p className="honorarium-cell__amount period-plan-amount-block">
                     <span
                       className={[
                         "period-plan-fact",
-                        deliveryError
+                        shippingError
                           ? "period-plan-fact--na"
-                          : logisticsShareVsPlanOk === true
+                          : shippingAvgVsPlanOk === true
                             ? "period-plan-fact--ok"
-                            : logisticsShareVsPlanOk === false
+                            : shippingAvgVsPlanOk === false
                               ? "period-plan-fact--warn"
                               : "period-plan-fact--na",
                       ].join(" ")}
                       title={
-                        deliveryError
-                          ? deliveryError
-                          : logisticsShareVsPlanOk === true
+                        shippingError
+                          ? shippingError
+                          : shippingAvgVsPlanOk === true
                             ? "В норме: факт не выше плана"
-                            : logisticsShareVsPlanOk === false
+                            : shippingAvgVsPlanOk === false
                               ? "Выше плана"
                               : "Недостаточно данных для сравнения"
                       }
                     >
-                      {deliveryError ? "—" : formatPercent(logisticsSharePercent)}
+                      {shippingError ? "—" : formatDays(shippingAvgDays)}
                     </span>
                     <span className="period-plan-sep" aria-hidden="true">
                       /
                     </span>
                     <span className="period-plan-target">
-                      {formatPercent(planLogisticsSharePercent)}
+                      {formatDays(planShippingAvgDays)}
                     </span>
                   </p>
                   <p className="honorarium-cell__hint">Факт сейчас · цель (план) на месяц</p>
@@ -1673,7 +1766,7 @@ export default function App() {
 
               <article
                 className="honorarium-cell honorarium-cell--bonus honorarium-cell--tone-violet"
-                aria-label="Бонус за доставку и долю логистики"
+                aria-label="Бонус за доставку"
                 role="listitem"
               >
                 <HonorariumBonusEyebrow label='Бонус "ЛОГИСТИКА"' />
@@ -1971,7 +2064,7 @@ export default function App() {
 
             <section
               className="delivery-cost-strip panel logistics-block logistics-block--framed"
-              aria-label="Логистика: доставка, доля логистики и закупки"
+              aria-label="Логистика: доставка и закупки"
             >
               <header className="logistics-block-head">
                 <div className="logistics-block-head-accent" aria-hidden="true" />
@@ -1980,19 +2073,11 @@ export default function App() {
                 </div>
               </header>
               <div className="logistics-with-procurement">
-                {deliveryError ? (
-                  <p
-                    className="delivery-cost-error delivery-cost-error--span logistics-procurement-error"
-                    role="alert"
-                  >
-                    {deliveryError}
-                  </p>
-              ) : (
                 <>
                     <div className="logistics-left-column">
                     <div className="logistics-band logistics-band--fact">
                       <div className="logistics-band-cards">
-                        <article className="delivery-cost-card delivery-cost-card--metric delivery-cost-card--nested delivery-cost-card--delivery delivery-cost-card--fact-plan">
+                        <article className="delivery-cost-card delivery-cost-card--metric delivery-cost-card--nested delivery-cost-card--delivery delivery-cost-card--fact-plan logistics-metric-card">
                           <div className="logistics-mini-card-head">
                             <h4 className="logistics-mini-card-title">Средняя стоимость доставки</h4>
                             <a
@@ -2004,6 +2089,16 @@ export default function App() {
                               Таблица ↗
                             </a>
                           </div>
+                          {deliveryError ? (
+                            <p
+                              className="delivery-cost-error delivery-cost-error--span"
+                              role="alert"
+                            >
+                              {deliveryError}
+                            </p>
+                          ) : (
+                            <>
+                          <div className="logistics-mini-card-body">
                           <div className="logistics-fact-plan-split">
                             <div
                               className={logisticsFactPlanFactColClass(
@@ -2024,9 +2119,9 @@ export default function App() {
                               }
                             >
                               <span className="logistics-fact-plan-tag">Факт</span>
-                              <p className="logistics-fact-plan-role">Среднее по записям I</p>
+                              <p className="logistics-fact-plan-role">Сумма H ÷ сумма G</p>
                               <p className="delivery-cost-value logistics-fact-plan-value logistics-fact-plan-value--in-cell">
-                                {deliveryError ? "—" : formatRubPerKg(deliveryAvgRubPerKg)}
+                                {formatRubPerKg(deliveryAvgRubPerKg)}
                               </p>
                             </div>
                             <div className="logistics-fact-plan-col logistics-fact-plan-col--plan">
@@ -2041,77 +2136,116 @@ export default function App() {
                               </p>
                             </div>
                           </div>
+                          </div>
+                          <footer className="logistics-mini-card-foot">
                           <p className="delivery-cost-meta">
-                            {deliveryRowsUsed > 0
-                              ? `Среднее за период · ${deliveryRowsUsed} записей (заполненный I ≥ 0)`
+                            {deliveryAvgRubPerKg != null && deliveryRowsInPeriod > 0
+                              ? `ΣH / ΣG за период · ${deliveryRowsInPeriod} строк с датой в F`
                               : deliveryRowsInPeriod > 0
-                                ? "Нет заполненных значений I ≥ 0 за период"
+                                ? "Сумма G за период равна нулю — нельзя посчитать ₽/кг"
                                 : "Нет строк с датой в F в выбранном периоде"}
                           </p>
+                          <div className="logistics-mini-card-foot-slot" aria-hidden="true" />
+                          </footer>
+                            </>
+                          )}
                         </article>
-                        <article className="delivery-cost-card delivery-cost-card--metric delivery-cost-card--nested delivery-cost-card--share delivery-cost-card--fact-plan">
+                        <article
+                          className={`delivery-cost-card delivery-cost-card--metric delivery-cost-card--nested delivery-cost-card--shipping delivery-cost-card--fact-plan logistics-metric-card${shippingLoading ? " logistics-metric-card--busy" : ""}`}
+                          aria-busy={shippingLoading}
+                        >
                           <div className="logistics-mini-card-head">
-                            <h4 className="logistics-mini-card-title">Доля логистики</h4>
+                            <h4 className="logistics-mini-card-title">Среднее время отгрузки</h4>
                             <a
                               className="logistics-mini-card-sheet-link"
-                              href={DELIVERY_LOGISTICS_SOURCE_SHEET_URL}
+                              href={MOYSKLAD_CUSTOMER_ORDERS_URL}
                               target="_blank"
                               rel="noopener noreferrer"
                             >
-                              Таблица ↗
+                              МойСклад ↗
                             </a>
                           </div>
-                          <div className="logistics-fact-plan-split">
-                            <div
-                              className={logisticsFactPlanFactColClass(
-                                logisticsFactNotWorseThanPlan(
-                                  logisticsSharePercent,
-                                  planLogisticsSharePercent,
-                                ),
-                                { noData: Boolean(deliveryError) },
-                              )}
-                              title={
-                                deliveryError
-                                  ? deliveryError
-                                  : logisticsShareVsPlanOk === true
-                                    ? "Факт не выше плана"
-                                    : logisticsShareVsPlanOk === false
-                                      ? "Факт выше плана"
-                                      : "Недостаточно данных для сравнения"
-                              }
+                          {shippingError ? (
+                            <p
+                              className="delivery-cost-error delivery-cost-error--span"
+                              role="alert"
                             >
-                              <span className="logistics-fact-plan-tag">Факт</span>
-                              <p className="logistics-fact-plan-role">Доля к отгрузкам за период</p>
-                              <p className="delivery-cost-value delivery-cost-value--percent logistics-fact-plan-value logistics-fact-plan-value--in-cell">
-                                {deliveryError ? "—" : formatPercent(logisticsSharePercent)}
+                              {shippingError}
+                            </p>
+                          ) : (
+                            <>
+                              <div className="logistics-mini-card-body">
+                              <div className="logistics-fact-plan-split">
+                                <div
+                                  className={logisticsFactPlanFactColClass(
+                                    logisticsFactNotWorseThanPlan(
+                                      shippingAvgDays,
+                                      planShippingAvgDays,
+                                    ),
+                                    { noData: Boolean(shippingError) },
+                                  )}
+                                  title={
+                                    shippingError
+                                      ? shippingError
+                                      : shippingAvgVsPlanOk === true
+                                        ? "Факт не выше плана"
+                                        : shippingAvgVsPlanOk === false
+                                          ? "Факт выше плана"
+                                          : "Недостаточно данных для сравнения"
+                                  }
+                                >
+                                  <span className="logistics-fact-plan-tag">Факт</span>
+                                  <p className="logistics-fact-plan-role">МойСклад · created → отгрузка</p>
+                                  <p className="delivery-cost-value logistics-fact-plan-value logistics-fact-plan-value--in-cell">
+                                    {shippingLoading ? "…" : formatDays(shippingAvgDays)}
+                                  </p>
+                                </div>
+                                <div className="logistics-fact-plan-col logistics-fact-plan-col--plan">
+                                  <span className="logistics-fact-plan-tag logistics-fact-plan-tag--plan">
+                                    План
+                                  </span>
+                                  <p className="logistics-fact-plan-role logistics-fact-plan-role--plan">
+                                    Целевой показатель
+                                  </p>
+                                  <p className="delivery-cost-value delivery-cost-value--plan-compact logistics-fact-plan-value--in-cell">
+                                    {formatDays(planShippingAvgDays)}
+                                  </p>
+                                </div>
+                              </div>
+                              </div>
+                              <footer className="logistics-mini-card-foot">
+                              <p className="delivery-cost-meta">
+                                {shippingLoading
+                                  ? "Пересчёт по заказам МойСклад…"
+                                  : shippingOrdersInPeriod > 0
+                                    ? shippingOrdersShipped > 0
+                                      ? `${shippingOrdersShipped} отгружено из ${shippingOrdersInPeriod} заказов покупателей за период`
+                                      : `${shippingOrdersInPeriod} заказов за период — отгрузок пока нет`
+                                    : "Нет заказов покупателей в МойСклад за выбранный период"}
                               </p>
-                            </div>
-                            <div className="logistics-fact-plan-col logistics-fact-plan-col--plan">
-                              <span className="logistics-fact-plan-tag logistics-fact-plan-tag--plan">
-                                План
-                              </span>
-                              <p className="logistics-fact-plan-role logistics-fact-plan-role--plan">
-                                Целевой показатель
-                              </p>
-                              <p className="delivery-cost-value delivery-cost-value--percent delivery-cost-value--plan-compact logistics-fact-plan-value--in-cell">
-                                {formatPercent(planLogisticsSharePercent)}
-                              </p>
-                            </div>
-                          </div>
-                          <p className="delivery-cost-meta">
-                            {deliveryHValuesCount > 0
-                              ? logisticsSharePercent != null
-                                ? `Ненулевых в H: ${deliveryHValuesCount}`
-                                : "Сумма по E = 0 — проверьте E"
-                              : "В H нет ненулевых за период"}
-                          </p>
+                              <label className="logistics-shipping-marketplace-toggle">
+                                <input
+                                  type="checkbox"
+                                  checked={shippingIncludeMarketplaces}
+                                  disabled={shippingLoading}
+                                  onChange={(e) => {
+                                    const checked = e.target.checked;
+                                    setShippingIncludeMarketplaces(checked);
+                                    void reloadShippingKpi(checked);
+                                  }}
+                                />
+                                <span>вместе с заказами с маркетплейсов</span>
+                              </label>
+                              </footer>
+                            </>
+                          )}
                         </article>
                       </div>
                       <article
                         className="finance-pfb-tile finance-pfb-tile--bonus finance-pfb-tile--bonus-star logistics-bonus-as-finance-tile"
                         aria-label="Бонус логистики за период"
                       >
-                        <BonusPanelHeader subtitle="За выполнение плана по доставке и доле логистики" />
+                        <BonusPanelHeader subtitle="За выполнение плана по доставке и среднему времени отгрузки" />
                         <p className="finance-pfb-value finance-pfb-value--rub">
                           {formatRub(deliveryLogisticsBonusRub)}
                         </p>
@@ -2206,7 +2340,6 @@ export default function App() {
                       </div>
                     </aside>
                 </>
-              )}
               </div>
             </section>
             </div>

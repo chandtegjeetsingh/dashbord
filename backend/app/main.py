@@ -17,13 +17,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.database import get_db, init_db
-from app.google_sheets_client import (
-    _parse_money,
-    _parse_sheet_date,
-    _sheet_cell_has_value,
-    fetch_sheet_rows,
-)
+from app.google_sheets_client import _parse_money, _parse_sheet_date, fetch_sheet_rows
 from app.kpi_format import snapshot_history_row, snapshot_to_payload
+from app.moysklad_client import MoySkladConfigError, compute_avg_customer_shipping_days
 from app.models import DailySnapshot, DashboardSetting, PeriodDayMetric
 from app.period_util import default_period_dates
 from app.yougile_client import (
@@ -49,7 +45,7 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(
-    title="Дашборд KPI",
+    title="Хозяйка закромов",
     description="API дашборда KPI (Google Sheets, план, снимки).",
     version="0.1.0",
     lifespan=lifespan,
@@ -81,6 +77,7 @@ DbSession = Annotated[Session, Depends(get_db)]
 _COST_RATIO_PLAN_KEY = "cost_ratio_plan_percent"
 _DELIVERY_AVG_PLAN_KEY = "delivery_avg_plan_rub_per_kg"
 _LOGISTICS_SHARE_PLAN_KEY = "logistics_share_plan_percent"
+_SHIPPING_AVG_PLAN_DAYS_KEY = "shipping_avg_plan_days"
 _TASKS_BONUS_PERCENT_KEY = "tasks_bonus_plan_percent"
 
 
@@ -174,6 +171,13 @@ def _get_delivery_avg_global(db: Session) -> Optional[float]:
     return avg
 
 
+def _get_shipping_avg_plan_days_global(db: Session) -> Optional[float]:
+    days = _get_setting_float(db, _SHIPPING_AVG_PLAN_DAYS_KEY)
+    if days is None:
+        days = _parse_percent_env(os.getenv("KPI_SHIPPING_AVG_PLAN_DAYS", ""))
+    return days
+
+
 def _get_logistics_share_global(db: Session) -> Optional[float]:
     sh = _get_setting_float(db, _LOGISTICS_SHARE_PLAN_KEY)
     if sh is None:
@@ -206,6 +210,8 @@ def _resolve_monthly_plan(db: Session, ym: str) -> Dict[str, object]:
     da = da_o if da_o is not None else _get_delivery_avg_global(db)
     ls_o = _parse_float_from_override(raw.get("logistics_share_plan_percent"))
     ls = ls_o if ls_o is not None else _get_logistics_share_global(db)
+    sh_o = _parse_float_from_override(raw.get("shipping_avg_plan_days"))
+    sh = sh_o if sh_o is not None else _get_shipping_avg_plan_days_global(db)
     tb_o = _parse_float_from_override(raw.get("tasks_bonus_percent"))
     tb = tb_o if tb_o is not None else _get_tasks_bonus_global(db)
     return {
@@ -213,6 +219,7 @@ def _resolve_monthly_plan(db: Session, ym: str) -> Dict[str, object]:
         "cost_ratio_plan_percent": round(cr, 4) if cr is not None else None,
         "delivery_avg_rub_per_kg": round(da, 2) if da is not None else None,
         "logistics_share_plan_percent": round(ls, 4) if ls is not None else None,
+        "shipping_avg_plan_days": round(sh, 1) if sh is not None else None,
         "tasks_bonus_percent": round(tb, 2) if tb is not None else None,
     }
 
@@ -316,16 +323,17 @@ def _put_setting_float(db: Session, key: str, value: float) -> None:
 
 @app.get("/api/settings/delivery-logistics-plan")
 def get_delivery_logistics_plan(db: DbSession) -> Dict[str, Optional[float]]:
-    """Плановые: средняя доставка ₽/кг и доля логистики % (для бонуса и карточки «План»)."""
+    """Плановые: средняя доставка ₽/кг и среднее время отгрузки, дн. (для бонуса и «План»)."""
     avg = _get_setting_float(db, _DELIVERY_AVG_PLAN_KEY)
     if avg is None:
         avg = _parse_percent_env(os.getenv("KPI_DELIVERY_AVG_PLAN_RUB_PER_KG", ""))
-    sh = _get_setting_float(db, _LOGISTICS_SHARE_PLAN_KEY)
+    sh = _get_setting_float(db, _SHIPPING_AVG_PLAN_DAYS_KEY)
     if sh is None:
-        sh = _parse_percent_env(os.getenv("KPI_LOGISTICS_SHARE_PLAN_PERCENT", ""))
+        sh = _parse_percent_env(os.getenv("KPI_SHIPPING_AVG_PLAN_DAYS", ""))
     return {
         "delivery_avg_rub_per_kg": round(avg, 2) if avg is not None else None,
-        "logistics_share_plan_percent": round(sh, 4) if sh is not None else None,
+        "shipping_avg_plan_days": round(sh, 1) if sh is not None else None,
+        "logistics_share_plan_percent": None,
     }
 
 
@@ -371,6 +379,26 @@ def put_delivery_logistics_plan(
                     detail="logistics_share_plan_percent вне диапазона (0…500)",
                 )
             _put_setting_float(db, _LOGISTICS_SHARE_PLAN_KEY, v)
+    if "shipping_avg_plan_days" in body:
+        raw = body.get("shipping_avg_plan_days")
+        if raw is None or raw == "":
+            row = db.get(DashboardSetting, _SHIPPING_AVG_PLAN_DAYS_KEY)
+            if row:
+                db.delete(row)
+        else:
+            try:
+                v = float(str(raw).strip().replace(",", "."))
+            except (TypeError, ValueError) as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail="shipping_avg_plan_days должен быть числом",
+                ) from e
+            if v < 0 or v > 365:
+                raise HTTPException(
+                    status_code=400,
+                    detail="shipping_avg_plan_days вне диапазона (0…365)",
+                )
+            _put_setting_float(db, _SHIPPING_AVG_PLAN_DAYS_KEY, v)
     db.commit()
     return get_delivery_logistics_plan(db)
 
@@ -511,6 +539,25 @@ def put_monthly_plan(
                     detail="logistics_share_plan_percent вне 0…500",
                 )
             cur["logistics_share_plan_percent"] = x
+
+    if "shipping_avg_plan_days" in body:
+        v = body.get("shipping_avg_plan_days")
+        if v is None or v == "":
+            cur.pop("shipping_avg_plan_days", None)
+        else:
+            try:
+                x = float(str(v).strip().replace(",", "."))
+            except (TypeError, ValueError) as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail="shipping_avg_plan_days должен быть числом",
+                ) from e
+            if x < 0 or x > 365:
+                raise HTTPException(
+                    status_code=400,
+                    detail="shipping_avg_plan_days вне 0…365",
+                )
+            cur["shipping_avg_plan_days"] = x
 
     if "tasks_bonus_percent" in body:
         v = body.get("tasks_bonus_percent")
@@ -786,7 +833,7 @@ def kpi_delivery_cost_per_kg(
 ) -> Dict[str, object]:
     """
     По строкам с датой в F внутри периода [date_from, date_to]:
-    - средняя стоимость доставки за 1 кг — среднее по непустым I с числом ≥ 0;
+    - средняя стоимость доставки (факт, ₽/кг) — сумма H / сумма G;
     - доля логистики — (сумма H) / (сумма E) × 100% (числа через _parse_money).
     Таблица и лист — в .env.
     """
@@ -804,8 +851,8 @@ def kpi_delivery_cost_per_kg(
         rows = fetch_sheet_rows(
             spreadsheet_id=spreadsheet_id,
             sheet_name=sheet_name,
-            tq="select E, F, H, I",
-            prefer_formatted_for_cols=frozenset({"E", "F", "H", "I"}),
+            tq="select E, F, G, H, I",
+            prefer_formatted_for_cols=frozenset({"E", "F", "G", "H", "I"}),
         )
     except Exception as e:
         raise HTTPException(
@@ -817,9 +864,9 @@ def kpi_delivery_cost_per_kg(
             ),
         ) from e
 
-    costs: list[float] = []
     sum_h = 0.0
     sum_e = 0.0
+    sum_g = 0.0
     rows_in_period = 0
     h_values_count = 0
     for r in rows:
@@ -834,35 +881,70 @@ def kpi_delivery_cost_per_kg(
         rows_in_period += 1
         val_h = _parse_money(h_raw)
         val_e = _parse_money(r.get("E"))
+        val_g = _parse_money(r.get("G"))
         sum_h += val_h
         sum_e += val_e
+        sum_g += val_g
         if val_h != 0.0:
             h_values_count += 1
-        if _sheet_cell_has_value(i_raw):
-            val_i = _parse_money(i_raw)
-            if val_i >= 0:
-                costs.append(val_i)
 
     share_pct: Optional[float] = None
     if sum_e > 0:
         share_pct = round((sum_h / sum_e) * 100.0, 2)
 
-    if costs:
-        avg_rub = round(sum(costs) / len(costs), 2)
-    else:
-        avg_rub = None
+    avg_rub: Optional[float] = None
+    if sum_g > 0:
+        avg_rub = round(sum_h / sum_g, 2)
 
     return {
         "avg_rub_per_kg": avg_rub,
-        "rows_used": len(costs),
+        "rows_used": rows_in_period,
         "rows_in_period": rows_in_period,
         "h_values_count": h_values_count,
         "logistics_share_percent": share_pct,
         "sum_h_rub": round(sum_h, 2),
         "sum_e_rub": round(sum_e, 2),
+        "sum_g_rub": round(sum_g, 2),
         "period_from": p_from.isoformat(),
         "period_to": p_to.isoformat(),
     }
+
+
+@app.get("/api/kpi/avg-shipping-days")
+def kpi_avg_shipping_days(
+    date_from: Annotated[
+        Optional[date],
+        Query(description="Начало периода (включительно)"),
+    ] = None,
+    date_to: Annotated[
+        Optional[date],
+        Query(description="Конец периода (включительно)"),
+    ] = None,
+    include_marketplaces: Annotated[
+        bool,
+        Query(
+            description="Учитывать заказы маркетплейсов (Ozon, РВБ/Wildberries)",
+        ),
+    ] = False,
+) -> Dict[str, object]:
+    """
+    Среднее время отгрузки заказов покупателей (МойСклад, customerorder):
+    от created до первой проведённой отгрузки (demand.moment).
+    """
+    p_from, p_to = _parse_period(date_from, date_to)
+    try:
+        return compute_avg_customer_shipping_days(
+            p_from,
+            p_to,
+            include_marketplaces=include_marketplaces,
+        )
+    except MoySkladConfigError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Не удалось получить заказы покупателей из МойСклад: {e!s}",
+        ) from e
 
 
 @app.get("/api/integrations/yougile/tasks")
