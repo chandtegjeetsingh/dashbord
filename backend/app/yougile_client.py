@@ -127,13 +127,16 @@ def _find_user_id_by_name(employee_name: str) -> str | None:
     return None
 
 
-def _fetch_all_tasks() -> list[dict[str, Any]]:
+def _paginate_tasks(extra_params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     # YouGile v2 отдает paging/content, забираем все страницы.
     offset = 0
     limit = 100
     out: list[dict[str, Any]] = []
     while True:
-        payload = _request_json("tasks", params={"limit": limit, "offset": offset})
+        params: dict[str, Any] = {"limit": limit, "offset": offset}
+        if extra_params:
+            params.update(extra_params)
+        payload = _request_json("tasks", params=params)
         items = _extract_items(payload)
         out.extend(items)
         if not isinstance(payload, dict):
@@ -144,6 +147,22 @@ def _fetch_all_tasks() -> list[dict[str, Any]]:
         got_limit = int(paging.get("limit") or limit)
         offset = int(paging.get("offset") or offset) + got_limit
     return out
+
+
+def _fetch_all_tasks() -> list[dict[str, Any]]:
+    return _paginate_tasks()
+
+
+def _fetch_tasks_for_user(user_id: str) -> list[dict[str, Any]]:
+    """Только задачи конкретного исполнителя — фильтр на стороне YouGile (быстро).
+
+    Раньше тянули ВЕСЬ список компании (сотни задач, десятки страниц → ~100 c).
+    Параметр assignedTo сокращает выборку в разы.
+    """
+    uid = _norm_text(user_id)
+    if not uid:
+        return []
+    return _paginate_tasks({"assignedTo": uid})
 
 
 def _is_task_active(task: dict[str, Any]) -> bool:
@@ -289,7 +308,7 @@ def get_employee_tasks(
     if not user_id:
         return []
 
-    tasks_raw = _fetch_all_tasks()
+    tasks_raw = _fetch_tasks_for_user(user_id)
     tasks: list[YougileTask] = []
     for t in tasks_raw:
         if user_id not in _task_assignee_ids(t):

@@ -1161,21 +1161,33 @@ export default function App() {
             : "Не удалось загрузить время отгрузки",
       }));
 
-    const [kc, kd, rr, transitRes, monthlyPlanRes, deliveryRes, shippingRes] =
+    // График «Продажи · Себестоимость · Закупки» берём из БД (быстро) и рисуем
+    // сразу, не дожидаясь Google Sheets/МойСклад — иначе блок ждёт самый
+    // медленный запрос. Остальные карточки догружаются следующим шагом.
+    try {
+      const [kc, kd] = await Promise.all([
+        fetchJson<KpiPayload>(`/api/kpi/current?${q}`),
+        fetchJson<{ days: DailyBreakdownDay[] }>(`/api/kpi/daily-breakdown?${q}`),
+      ]);
+      if (requestId !== latestKpiRequestIdRef.current) return;
+      setKpi(kc);
+      setDailyDays(kd.days || []);
+    } catch {
+      /* оставляем прошлые значения графика, не блокируем остальное */
+    }
+
+    const reorderP = fetchJson<{ items: ReorderItem[]; categories?: string[] }>(
+      "/api/kpi/reorder-raw-materials",
+    );
+    const [rr, transitRes, monthlyPlanRes, deliveryRes, shippingRes] =
       await Promise.all([
-      fetchJson<KpiPayload>(`/api/kpi/current?${q}`),
-      fetchJson<{ days: DailyBreakdownDay[] }>(`/api/kpi/daily-breakdown?${q}`),
-      fetchJson<{ items: ReorderItem[]; categories?: string[] }>(
-        "/api/kpi/reorder-raw-materials",
-      ),
+      reorderP,
       transitP,
       monthlyPlanP,
       deliveryP,
       shippingP,
     ]);
     if (requestId !== latestKpiRequestIdRef.current) return;
-    setKpi(kc);
-    setDailyDays(kd.days || []);
     const items = rr.items || [];
     const fromApi = rr.categories ?? [];
     const labels =

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import time
 from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
@@ -16,7 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.database import get_db, init_db
+from app.database import SessionLocal, get_db, init_db
 from app.google_sheets_client import _parse_money, _parse_sheet_date, fetch_sheet_rows
 from app.kpi_format import snapshot_history_row, snapshot_to_payload
 from app.moysklad_client import MoySkladConfigError, compute_avg_customer_shipping_days
@@ -36,12 +38,162 @@ load_dotenv(_backend_dir.parent / ".env")
 load_dotenv(_backend_dir / ".env")
 _yougile_employee_default = os.getenv("YOUGILE_EMPLOYEE", "Татьяна Живетьева").strip()
 _yougile_employee_id_default = os.getenv("YOUGILE_EMPLOYEE_ID", "").strip()
+_YOUGILE_DEFAULT_LIMIT = 8
+
+# Кэш задач YouGile: запрос к API медленный (сотни задач), поэтому отдаём
+# из памяти мгновенно, а в фоне периодически обновляем (подтягиваем новые задачи).
+_yougile_cache: dict[str, dict] = {}
+_yougile_cache_lock = threading.Lock()
+_yougile_stop = threading.Event()
+
+
+def _yougile_refresh_sec() -> int:
+    raw = os.getenv("YOUGILE_REFRESH_SEC", "90").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        return 90
+    return max(20, min(n, 3600))
+
+
+def _yougile_cache_key(employee: str, limit: int) -> str:
+    return f"{employee.strip().casefold()}|{limit}"
+
+
+def _yougile_build_payload(employee: str, limit: int) -> dict:
+    items = get_employee_tasks(
+        employee_name=employee,
+        limit=limit,
+        employee_id=_yougile_employee_id_default or None,
+    )
+    return {
+        "employee": employee,
+        "items": [
+            {
+                "id": t.id,
+                "title": t.title,
+                "status": t.status,
+                "url": t.url,
+                "deadline_at": t.deadline_at,
+                "priority": t.priority,
+            }
+            for t in items
+        ],
+    }
+
+
+def _yougile_refresh(employee: str, limit: int) -> dict:
+    """Тянем задачи из YouGile и кладём в кэш. Возвращаем payload."""
+    payload = _yougile_build_payload(employee, limit)
+    with _yougile_cache_lock:
+        _yougile_cache[_yougile_cache_key(employee, limit)] = {
+            "payload": payload,
+            "fetched_at": time.time(),
+            "error": None,
+        }
+    return payload
+
+
+def _yougile_bg_loop() -> None:
+    """Фоновое обновление кэша задач сотрудника по умолчанию."""
+    while not _yougile_stop.is_set():
+        try:
+            _yougile_refresh(_yougile_employee_default, _YOUGILE_DEFAULT_LIMIT)
+        except Exception as e:  # сеть/конфиг — не роняем поток, пишем ошибку в кэш
+            with _yougile_cache_lock:
+                key = _yougile_cache_key(_yougile_employee_default, _YOUGILE_DEFAULT_LIMIT)
+                entry = _yougile_cache.get(key) or {"payload": None, "fetched_at": 0.0}
+                entry["error"] = str(e)
+                _yougile_cache[key] = entry
+        _yougile_stop.wait(_yougile_refresh_sec())
+
+
+# ===== Кэш среднего времени отгрузки (МойСклад) =====
+# Расчёт тяжёлый (~10 c: пагинация отгрузок по всем заказам периода). Держим
+# результат в памяти и обновляем в фоне — карточка/дашборд открываются мгновенно.
+_shipping_cache: dict[str, dict] = {}
+_shipping_cache_lock = threading.Lock()
+
+
+def _shipping_refresh_sec() -> int:
+    raw = os.getenv("SHIPPING_REFRESH_SEC", "180").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        return 180
+    return max(30, min(n, 3600))
+
+
+def _shipping_cache_key(p_from: date, p_to: date, include_marketplaces: bool) -> str:
+    return f"{p_from.isoformat()}|{p_to.isoformat()}|{int(include_marketplaces)}"
+
+
+def _shipping_refresh(p_from: date, p_to: date, include_marketplaces: bool) -> dict:
+    payload = compute_avg_customer_shipping_days(
+        p_from, p_to, include_marketplaces=include_marketplaces
+    )
+    with _shipping_cache_lock:
+        _shipping_cache[_shipping_cache_key(p_from, p_to, include_marketplaces)] = {
+            "payload": payload,
+            "fetched_at": time.time(),
+            "error": None,
+        }
+    return payload
+
+
+def _shipping_bg_loop() -> None:
+    """Фоновое обновление среднего времени отгрузки за текущий месяц (без маркетплейсов)."""
+    while not _yougile_stop.is_set():
+        try:
+            p_from, p_to = default_period_dates()
+            _shipping_refresh(p_from, p_to, False)
+        except Exception:
+            pass  # сеть/конфиг МойСклад — не роняем поток, повторим позже
+        _yougile_stop.wait(_shipping_refresh_sec())
+
+
+# ===== Фоновая синхронизация снимка KPI (Google Sheets + МойСклад → SQLite) =====
+# Цифры блока «Продажи · Себестоимость · Закупки» лежат в БД; обновляем их в фоне,
+# чтобы при открытии отдавать готовый снимок мгновенно, без ожидания POST /api/sync.
+def _sync_refresh_sec() -> int:
+    raw = os.getenv("SYNC_REFRESH_SEC", "300").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        return 300
+    return max(60, min(n, 3600))
+
+
+def _sync_bg_loop() -> None:
+    while not _yougile_stop.is_set():
+        try:
+            from app.sync_service import run_sync
+
+            p_from, p_to = default_period_dates()
+            db = SessionLocal()
+            try:
+                run_sync(db, p_from, p_to)
+            finally:
+                db.close()
+        except Exception:
+            pass  # источник недоступен — повторим на следующей итерации
+        _yougile_stop.wait(_sync_refresh_sec())
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
-    yield
+    # Фоновый прогрев кэшей — чтобы дашборд открывался мгновенно, а цифры
+    # подтягивались в фоне (YouGile, среднее время отгрузки, снимок KPI).
+    if os.getenv("YOUGILE_API_KEY", "").strip():
+        threading.Thread(target=_yougile_bg_loop, name="yougile-refresh", daemon=True).start()
+    if os.getenv("MOYSKLAD_TOKEN", "").strip() or os.getenv("MOYSKLAD_LOGIN", "").strip():
+        threading.Thread(target=_shipping_bg_loop, name="shipping-refresh", daemon=True).start()
+    threading.Thread(target=_sync_bg_loop, name="kpi-sync-refresh", daemon=True).start()
+    try:
+        yield
+    finally:
+        _yougile_stop.set()
 
 
 app = FastAPI(
@@ -932,15 +1084,35 @@ def kpi_avg_shipping_days(
     от created до первой проведённой отгрузки (demand.moment).
     """
     p_from, p_to = _parse_period(date_from, date_to)
+    key = _shipping_cache_key(p_from, p_to, include_marketplaces)
+    with _shipping_cache_lock:
+        entry = _shipping_cache.get(key)
+
+    # Свежий кэш — отдаём мгновенно (фоновый поток держит текущий месяц актуальным).
+    if entry and entry.get("payload") is not None:
+        age = time.time() - float(entry.get("fetched_at") or 0.0)
+        if age <= _shipping_refresh_sec():
+            payload = dict(entry["payload"])
+            payload["cached"] = True
+            payload["age_sec"] = round(age, 1)
+            return payload
+
+    # Кэш пуст или устарел — считаем синхронно и кладём в кэш.
     try:
-        return compute_avg_customer_shipping_days(
-            p_from,
-            p_to,
-            include_marketplaces=include_marketplaces,
-        )
+        payload = _shipping_refresh(p_from, p_to, include_marketplaces)
+        payload["cached"] = False
+        payload["age_sec"] = 0.0
+        return payload
     except MoySkladConfigError as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     except Exception as e:
+        # Лучше отдать прошлый (устаревший) результат, чем ошибку и пустую карточку.
+        if entry and entry.get("payload") is not None:
+            payload = dict(entry["payload"])
+            payload["cached"] = True
+            payload["stale"] = True
+            payload["age_sec"] = round(time.time() - float(entry.get("fetched_at") or 0.0), 1)
+            return payload
         raise HTTPException(
             status_code=502,
             detail=f"Не удалось получить заказы покупателей из МойСклад: {e!s}",
@@ -958,29 +1130,35 @@ def yougile_employee_tasks(
         Query(ge=1, le=20, description="Максимум задач в ответе"),
     ] = 8,
 ) -> dict:
+    key = _yougile_cache_key(employee, limit)
+    with _yougile_cache_lock:
+        entry = _yougile_cache.get(key)
+
+    # Свежий кэш — отдаём мгновенно (фоновый поток держит его актуальным).
+    if entry and entry.get("payload") is not None:
+        age = time.time() - float(entry.get("fetched_at") or 0.0)
+        if age <= _yougile_refresh_sec():
+            payload = dict(entry["payload"])
+            payload["cached"] = True
+            payload["age_sec"] = round(age, 1)
+            return payload
+
+    # Кэш пуст или устарел — обновляем синхронно (после оптимизации это ~1-2 c).
     try:
-        items = get_employee_tasks(
-            employee_name=employee,
-            limit=limit,
-            employee_id=_yougile_employee_id_default or None,
-        )
-        return {
-            "employee": employee,
-            "items": [
-                {
-                    "id": t.id,
-                    "title": t.title,
-                    "status": t.status,
-                    "url": t.url,
-                    "deadline_at": t.deadline_at,
-                    "priority": t.priority,
-                }
-                for t in items
-            ],
-        }
+        payload = _yougile_refresh(employee, limit)
+        payload["cached"] = False
+        payload["age_sec"] = 0.0
+        return payload
     except YougileConfigError as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     except Exception as e:
+        # Если есть хоть какой-то старый кэш — лучше отдать его, чем ошибку.
+        if entry and entry.get("payload") is not None:
+            payload = dict(entry["payload"])
+            payload["cached"] = True
+            payload["age_sec"] = round(time.time() - float(entry.get("fetched_at") or 0.0), 1)
+            payload["stale"] = True
+            return payload
         raise HTTPException(
             status_code=502,
             detail=f"Не удалось получить задачи из YouGile: {e!s}",
