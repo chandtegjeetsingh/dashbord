@@ -1284,20 +1284,20 @@ export default function App() {
     [dailyDays],
   );
   const rawMaterialYAxisDomain = useMemo<[number, number]>(() => {
-    // Нижняя граница оси — фиксированные 2,3 млн ₽: остаток сырья держится в
-    // районе 2,4–3,0 млн, и без приподнятого «нуля» колебания почти не видно.
-    const FLOOR = 2_300_000;
+    // Ось «Остаток сырья»: фиксированный диапазон 1,9–3,0 млн ₽, чтобы движение
+    // читалось. Если данные выйдут за рамки — раздвигаем, чтобы не срезать линию.
+    const FLOOR = 1_900_000;
+    const CEIL = 3_000_000;
     const vals = dailyDays
       .map((d) => d.raw_material_stock)
       .filter((v) => Number.isFinite(v) && v > 0);
-    if (vals.length === 0) return [FLOOR, FLOOR + 100_000];
+    if (vals.length === 0) return [FLOOR, CEIL];
     const min = Math.min(...vals);
     const max = Math.max(...vals);
-    const span = Math.max(max - Math.min(min, FLOOR), 1);
-    const pad = Math.max(1, Math.round(span * 0.08));
-    // Обычно ось стартует с 2,3 млн; если остаток вдруг ниже — опускаем, чтобы не срезать линию.
+    const pad = Math.max(1, Math.round((max - min) * 0.08));
     const lower = Math.min(FLOOR, min - pad);
-    return [Math.max(0, lower), max + pad];
+    const upper = Math.max(CEIL, max + pad);
+    return [Math.max(0, lower), upper];
   }, [dailyDays]);
 
   /** Общая шкала ₽ для отгрузок, себестоимости отгрузок и закупок по дням. */
