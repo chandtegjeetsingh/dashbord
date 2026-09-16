@@ -1,42 +1,23 @@
-name: dashboard
+name: zakroma
 
 services:
   api:
-    build: ./backend
-    ports:
-      - "127.0.0.1:8000:8000"
+    image: dashboard-api:latest
+    restart: unless-stopped
     env_file: .env
     environment:
-      TZ: ${TZ:-UTC}
+      TZ: ${TZ:-Europe/Moscow}
       DATABASE_URL: sqlite:////data/dashboard.db
     volumes:
       - dashboard_data:/data
 
   web:
-    build: ./frontend
+    image: dashboard-web:latest
+    restart: unless-stopped
     ports:
-      - "8080:80"
-    expose:
-      - "80"
+      - "127.0.0.1:8130:80"
     depends_on:
       - api
 
-  # На ВМ: COMPOSE_PROFILES=with-https docker compose up -d --build (см. scripts/deploy.sh)
-  caddy:
-    profiles: ["with-https"]
-    image: caddy:2-alpine
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    depends_on:
-      - web
-
 volumes:
   dashboard_data:
-  caddy_data:
-  caddy_config:
